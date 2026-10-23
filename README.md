@@ -1,5 +1,3 @@
-<img src="assets/app-icon/AppIcon.png" width="96" align="left" alt="IRresponsible icon">
-
 # IRresponsible
 
 Headphone correction for macOS: find your headphones in AutoEq, load a correction, and compare it with bypass. Includes custom WAV impulses, saved presets, and a live spectrum.
