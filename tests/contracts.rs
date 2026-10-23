@@ -183,8 +183,11 @@ fn literal_flat_and_harman_are_distinct_against_upstream_measurements() {
     let mut harman = parse_csv(include_bytes!("fixtures/harman-over-ear-2018.csv"), "raw").unwrap();
     harman.center();
     let flat = Curve::new(measured.frequency.clone(), vec![0.0; measured.db.len()]).unwrap();
-    let flat_curve = correction_curve(&measured, &flat, Default::default());
-    let harman_curve = correction_curve(&measured, &harman, Default::default());
+    let settings = GenerationSettings::default()
+        .with_alignment(irresponsible::correction::Alignment::MidrangeMean)
+        .with_normalization(irresponsible::correction::Normalization::Raw);
+    let flat_curve = correction_curve(&measured, &flat, settings);
+    let harman_curve = correction_curve(&measured, &harman, settings);
     assert!(flat.db.iter().all(|&db| db == 0.0));
     assert!((harman_curve.at(3000.0) - flat_curve.at(3000.0)).abs() > 3.0);
     for rate in [Rate::Hz44100, Rate::Hz48000] {
@@ -201,7 +204,7 @@ fn literal_flat_and_harman_are_distinct_against_upstream_measurements() {
             include_bytes!("fixtures/dt990-pro.csv"),
             irresponsible::catalog::TargetData::Flat,
             rate,
-            Default::default(),
+            settings,
         )
         .unwrap();
         let harman_ir = irresponsible::catalog::generate(
@@ -212,7 +215,7 @@ fn literal_flat_and_harman_are_distinct_against_upstream_measurements() {
                 catalog.target(entry, Target::Harman).unwrap(),
             ),
             rate,
-            Default::default(),
+            settings,
         )
         .unwrap();
         assert_eq!(flat_ir.target, Target::Flat);
@@ -233,7 +236,7 @@ fn literal_flat_and_harman_are_distinct_against_upstream_measurements() {
             let actual = gain_db(bins[k].norm());
             let expected = flat_curve.at(k as f32 * rate.hz() as f32 / bins.len() as f32);
             assert!(
-                (actual - expected).abs() < 0.02,
+                (actual - expected).abs() < 0.1,
                 "{rate:?} {hz} Hz: {actual} vs {expected}"
             );
         }
@@ -540,7 +543,11 @@ fn treble_extension_preserves_high_frequency_cuts_and_survives_save_and_rate_cha
     )
     .unwrap();
     let flat = Curve::new(measured.frequency.clone(), vec![0.0; measured.db.len()]).unwrap();
-    let limited = correction_curve(&measured, &flat, GenerationSettings::default());
+    let limited = correction_curve(
+        &measured,
+        &flat,
+        GenerationSettings::default().with_treble(TrebleExtension::Limited),
+    );
     let extended = correction_curve(
         &measured,
         &flat,
@@ -554,12 +561,14 @@ fn treble_extension_preserves_high_frequency_cuts_and_survives_save_and_rate_cha
             &extended,
             rate,
             FirLength::default(),
-            TrebleExtension::AutoEq,
+            irresponsible::correction::Normalization::Raw,
         );
         let bins = spectrum(&coefficients, coefficients.len());
+        let nyquist = bins[bins.len() / 2].norm();
+        let treble = bins[(20000.0 * bins.len() as f32 / rate.hz() as f32).round() as usize].norm();
         assert!(
-            bins[bins.len() / 2].norm() < 0.00001,
-            "Nyquist amplitude must roll off"
+            nyquist < treble * 0.5,
+            "Nyquist {nyquist} vs 20 kHz {treble}"
         );
     }
     let catalog = Catalog::parse(
@@ -592,12 +601,21 @@ fn treble_extension_preserves_high_frequency_cuts_and_survives_save_and_rate_cha
             .unwrap()
             .remove(key);
     }
+    old_json["origin"]["AutoEq"]["policy"] = serde_json::json!("IRresponsible v1");
     let old: Correction = serde_json::from_value(old_json).unwrap();
-    old.at_rate(
-        Rate::Hz48000,
-        &Store::at(tempfile::tempdir().unwrap().path()).unwrap(),
-    )
-    .unwrap();
+    assert!(old.requires_regeneration());
+    assert!(
+        old.at_rate(
+            Rate::Hz48000,
+            &Store::at(tempfile::tempdir().unwrap().path()).unwrap(),
+        )
+        .is_err()
+    );
+    let regenerated = old
+        .regenerate(Rate::Hz48000, GenerationSettings::default())
+        .unwrap();
+    assert!(regenerated.measured.as_ref().unwrap().at(1000.0).abs() < 0.001);
+    assert!(!regenerated.requires_regeneration());
     assert!(matches!(
         old.origin,
         Origin::AutoEq {

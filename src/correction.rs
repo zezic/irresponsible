@@ -7,30 +7,21 @@ use rustfft::{FftPlanner, num_complex::Complex32};
 use serde::{Deserialize, Serialize};
 use std::{io::Cursor, path::Path};
 
+mod autoeq;
 mod generation;
+pub use autoeq::{correction_curve, minimum_phase};
 pub use generation::{
-    Alignment, FirLength, GenerationParameter, GenerationSettings, Normalization,
+    Alignment, BassExtension, ConchaInterference, FirLength, GenerationParameter,
+    GenerationSettings, Normalization,
 };
 
 pub const MAX_IR_FRAMES: usize = 262_144;
 pub const MAX_WAV_BYTES: u64 = 16 * 1024 * 1024;
-pub const POLICY: &str = "IRresponsible v1: 1/3-octave smoothing (1 octave above 6 kHz), +6/-18 dB, 12 dB/octave slope, 20 Hz-10 kHz correction, taper to unity at 16 kHz; 8192-point real-cepstrum minimum phase";
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrebleExtension {
-    #[default]
     Limited,
+    #[default]
     AutoEq,
-}
-impl TrebleExtension {
-    pub fn policy(self) -> &'static str {
-        match self {
-            Self::Limited => POLICY,
-            Self::AutoEq => {
-                "IRresponsible v2: 1/3-octave smoothing (1 octave above 6 kHz), +6/-18 dB, 12 dB/octave slope; extended treble correction; Nyquist attenuation; 8192-point real-cepstrum minimum phase"
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -297,10 +288,8 @@ impl Correction {
                 Ok(prepared)
             }
             Origin::Identity => Ok(Self::identity(rate)),
-            Origin::AutoEq {
-                policy, generation, ..
-            } => {
-                if *policy != generation.policy() {
+            Origin::AutoEq { generation, .. } => {
+                if self.requires_regeneration() {
                     return Err(invalid(
                         "Regenerate this correction with the current generation policy before changing rate",
                     ));
@@ -322,12 +311,11 @@ impl Correction {
             }
         }
     }
+    pub fn requires_regeneration(&self) -> bool {
+        matches!(&self.origin, Origin::AutoEq { policy, generation, .. } if *policy != generation.policy())
+    }
     pub fn regenerate(&self, rate: Rate, generation: GenerationSettings) -> Result<Self> {
-        let Origin::AutoEq {
-            generation: previous,
-            ..
-        } = &self.origin
-        else {
+        let Origin::AutoEq { .. } = &self.origin else {
             return Err(invalid(
                 "Published AutoEq and imported WAVs retain their coefficients. Choose an in-app target to edit its IR settings.",
             ));
@@ -341,10 +329,8 @@ impl Correction {
             .target_curve
             .as_mut()
             .ok_or_else(|| invalid("Generated correction is missing its target"))?;
-        if generation.alignment() != previous.alignment() {
-            measured.align(generation.alignment());
-            target.align(generation.alignment());
-        }
+        measured.align(generation.alignment());
+        target.align(generation.alignment());
         let coefficients = generated_impulse(measured, target, rate, generation);
         ir.channels = [coefficients.clone(), coefficients];
         ir.rate = rate;
@@ -524,39 +510,6 @@ fn resample_ir(
     })
 }
 
-/// Homomorphic spectral factorization. The real cepstrum keeps DC/Nyquist,
-/// doubles positive quefrencies, and removes negative quefrencies.
-pub fn minimum_phase(
-    curve: &Curve,
-    rate: Rate,
-    length: FirLength,
-    treble: TrebleExtension,
-) -> Vec<f32> {
-    let n = length.frames();
-    let mut planner = FftPlanner::new();
-    let forward = planner.plan_fft_forward(n);
-    let inverse = planner.plan_fft_inverse(n);
-    let mut bins: Vec<_> = (0..n)
-        .map(|i| {
-            let hz = i.min(n - i) as f32 * rate.hz() as f32 / n as f32;
-            Complex32::new(curve.at(hz.max(1.0)) * std::f32::consts::LN_10 / 20.0, 0.0)
-        })
-        .collect();
-    if treble == TrebleExtension::AutoEq {
-        // A finite log-magnitude floor keeps the homomorphic transform defined.
-        // AutoEq's published FIRs set the Nyquist amplitude to zero.
-        bins[n / 2].re = -120.0 * std::f32::consts::LN_10 / 20.0;
-    }
-    inverse.process(&mut bins);
-    bins.iter_mut().for_each(|v| *v /= n as f32);
-    bins[1..n / 2].iter_mut().for_each(|v| *v *= 2.0);
-    bins[n / 2 + 1..].fill(Complex32::default());
-    forward.process(&mut bins);
-    bins.iter_mut().for_each(|v| *v = v.exp());
-    inverse.process(&mut bins);
-    bins.iter().map(|v| v.re / n as f32).collect()
-}
-
 pub fn generated_impulse(
     measured: &Curve,
     target: &Curve,
@@ -567,76 +520,6 @@ pub fn generated_impulse(
         &correction_curve(measured, target, settings),
         rate,
         settings.length(),
-        settings.treble(),
+        settings.normalization(),
     )
-}
-
-pub fn correction_curve(measured: &Curve, target: &Curve, settings: GenerationSettings) -> Curve {
-    use GenerationParameter::*;
-    let mut error: Vec<_> = measured
-        .frequency
-        .iter()
-        .map(|&f| target.at(f) - measured.at(f))
-        .collect();
-    let raw = error.clone();
-    for (i, &hz) in measured.frequency.iter().enumerate() {
-        let width = if hz < settings.value(TrebleStart) {
-            settings.value(Smoothing)
-        } else {
-            settings.value(TrebleSmoothing)
-        };
-        let mut sum = 0.0;
-        let mut weight = 0.0;
-        for (&f, &db) in measured.frequency.iter().zip(&raw) {
-            let distance = (f / hz).log2() / (width / 2.0);
-            if distance.abs() <= 1.0 {
-                let w = 0.5 + 0.5 * (distance * std::f32::consts::PI).cos();
-                sum += w * db;
-                weight += w;
-            }
-        }
-        error[i] = (sum / weight).clamp(-settings.value(CutLimit), settings.value(BoostLimit));
-    }
-    for i in 1..error.len() {
-        let step =
-            settings.value(SlopeLimit) * (measured.frequency[i] / measured.frequency[i - 1]).log2();
-        error[i] = error[i].clamp(error[i - 1] - step, error[i - 1] + step);
-    }
-    for i in (0..error.len() - 1).rev() {
-        let step =
-            settings.value(SlopeLimit) * (measured.frequency[i + 1] / measured.frequency[i]).log2();
-        error[i] = error[i].clamp(error[i + 1] - step, error[i + 1] + step);
-    }
-    for (&hz, db) in measured.frequency.iter().zip(&mut error) {
-        let taper = if hz > settings.value(HighFull)
-            && settings.treble() == TrebleExtension::Limited
-        {
-            ((settings.value(HighUnity) - hz)
-                / (settings.value(HighUnity) - settings.value(HighFull)))
-            .clamp(0.0, 1.0)
-        } else {
-            ((hz - settings.value(LowUnity)) / (settings.value(LowFull) - settings.value(LowUnity)))
-                .clamp(0.0, 1.0)
-        };
-        *db *= taper;
-    }
-    let mut frequency = vec![1.0];
-    let mut db = vec![0.0];
-    if settings.value(LowUnity) > 1.0 {
-        frequency.push(settings.value(LowUnity));
-        db.push(0.0);
-    }
-    for (&hz, value) in measured.frequency.iter().zip(error) {
-        if hz > settings.value(LowUnity) {
-            frequency.push(hz);
-            db.push(value);
-        }
-    }
-    if settings.normalization() == Normalization::Peak {
-        let peak = db.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        for value in &mut db {
-            *value -= peak + 0.2;
-        }
-    }
-    Curve { frequency, db }
 }

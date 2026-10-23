@@ -3,8 +3,8 @@ use irresponsible::{
     audio::{self, Command, Event, Runtime, SystemOutput},
     catalog::{Catalog, CatalogFilter, CatalogTarget, Source},
     correction::{
-        Alignment, Correction, Curve, FirLength, GenerationParameter, GenerationSettings,
-        Normalization, Origin, TrebleExtension,
+        Alignment, BassExtension, ConchaInterference, Correction, Curve, FirLength,
+        GenerationParameter, GenerationSettings, Normalization, Origin, TrebleExtension,
     },
     domain::*,
     dsp::{Analysis, Engine},
@@ -106,6 +106,9 @@ enum Action {
     GenerationLength,
     GenerationAlignment,
     GenerationNormalization,
+    GenerationBass,
+    GenerationConcha,
+    GenerationCutLimit,
     ChooseLength(FirLength),
     ChooseAlignment(Alignment),
     ChooseNormalization(Normalization),
@@ -1428,6 +1431,34 @@ impl App {
             Action::ChooseNormalization(value) => {
                 self.generation_changed(self.settings.generation.with_normalization(value));
             }
+            Action::GenerationBass => {
+                let bass = match self.settings.generation.bass() {
+                    BassExtension::Extended => BassExtension::Tapered,
+                    BassExtension::Tapered => BassExtension::Extended,
+                };
+                self.generation_changed(self.settings.generation.with_bass(bass));
+            }
+            Action::GenerationConcha => {
+                let concha = match self.settings.generation.concha() {
+                    ConchaInterference::Absent => ConchaInterference::Present,
+                    ConchaInterference::Present => ConchaInterference::Absent,
+                };
+                self.generation_changed(self.settings.generation.with_concha(concha));
+            }
+            Action::GenerationCutLimit => {
+                let generation = self.settings.generation;
+                let generation = if generation.cut_limit().is_some() {
+                    generation.without_cut_limit()
+                } else {
+                    generation
+                        .with(
+                            GenerationParameter::CutLimit,
+                            generation.value(GenerationParameter::CutLimit),
+                        )
+                        .expect("the default cut limit is valid")
+                };
+                self.generation_changed(generation);
+            }
             Action::GenerationDefaults => {
                 self.generation_changed(self.settings.generation.reset_parameters())
             }
@@ -1769,7 +1800,8 @@ impl App {
         }
     }
     fn generation_changed(&mut self, generation: GenerationSettings) {
-        if self.settings.generation == generation {
+        let displayed = self.preview.as_ref().map_or(&self.active, |(view, _)| view);
+        if self.settings.generation == generation && !displayed.correction.requires_regeneration() {
             return;
         }
         self.settings.generation = generation;
@@ -3841,15 +3873,18 @@ impl App {
                 let settings = self.settings.generation;
                 let parameters: Vec<_> = GenerationParameter::ALL
                     .into_iter()
-                    .filter(|parameter| {
-                        settings.treble() != TrebleExtension::AutoEq
-                            || !matches!(
-                                parameter,
-                                GenerationParameter::HighFull | GenerationParameter::HighUnity
-                            )
+                    .filter(|parameter| match parameter {
+                        GenerationParameter::HighFull | GenerationParameter::HighUnity => {
+                            settings.treble() == TrebleExtension::Limited
+                        }
+                        GenerationParameter::LowFull | GenerationParameter::LowUnity => {
+                            settings.bass() == BassExtension::Tapered
+                        }
+                        GenerationParameter::CutLimit => settings.cut_limit().is_some(),
+                        _ => true,
                     })
                     .collect();
-                let height = 5.0 * 32.0 + parameters.len() as f64 * 32.0 + 112.0;
+                let height = 8.0 * 32.0 + parameters.len() as f64 * 32.0 + 112.0;
                 let max_scroll = (height - content.height()).max(0.0);
                 self.scroll = self.scroll.clamp(0.0, max_scroll);
                 let first_hit = p.hits.len();
@@ -3894,12 +3929,32 @@ impl App {
                 p.chip(
                     INSET,
                     y,
-                    "Extend treble / AutoEq rolloff",
+                    "Extend treble (AutoEq)",
                     Action::TrebleExtension,
                     settings.treble() == TrebleExtension::AutoEq,
                     true,
                 );
                 y += 32.0;
+                for (label, action, selected) in [
+                    (
+                        "Taper bass",
+                        Action::GenerationBass,
+                        settings.bass() == BassExtension::Tapered,
+                    ),
+                    (
+                        "Limit cuts",
+                        Action::GenerationCutLimit,
+                        settings.cut_limit().is_some(),
+                    ),
+                    (
+                        "Concha interference",
+                        Action::GenerationConcha,
+                        settings.concha() == ConchaInterference::Present,
+                    ),
+                ] {
+                    p.chip(INSET, y, label, action, selected, true);
+                    y += 32.0;
+                }
                 for parameter in parameters {
                     let label = parameter.label();
                     p.text(
@@ -3930,14 +3985,20 @@ impl App {
                     y,
                     "Restore defaults",
                     Action::GenerationDefaults,
-                    settings != settings.reset_parameters(),
+                    settings != settings.reset_parameters()
+                        || self
+                            .preview
+                            .as_ref()
+                            .map_or(&self.active, |(view, _)| view)
+                            .correction
+                            .requires_regeneration(),
                 );
                 y += 40.0;
                 for text in [
                     "Applies to in-app target modes.",
                     "Edits prepare a comparison preview.",
-                    "Minimum phase / real cepstrum.",
-                    "Published AutoEq uses a different FIR.",
+                    "Stored presets keep their current audio.",
+                    "Replace loaded applies the preview.",
                 ] {
                     p.text(
                         text,
@@ -5094,7 +5155,7 @@ mod regression_tests {
         }
         app.action(Action::Harman);
         wait_for_preview(&mut app);
-        let limited = app.preview.as_ref().unwrap().0.response[0].at(18000.0);
+        let extended = app.preview.as_ref().unwrap().0.response[0].at(18000.0);
         app.build_scene(Size::new(WIDTH, HEIGHT), 1.0);
         assert!(
             app.hits
@@ -5106,12 +5167,12 @@ mod regression_tests {
         let ir = &app.preview.as_ref().unwrap().0;
         assert!(matches!(
             ir.correction.origin,
-            Origin::AutoEq { generation, .. } if generation.treble() == TrebleExtension::AutoEq
+            Origin::AutoEq { generation, .. } if generation.treble() == TrebleExtension::Limited
         ));
-        assert!((ir.response[0].at(18000.0) - limited).abs() > 1.0);
+        assert!((ir.response[0].at(18000.0) - extended).abs() > 1.0);
         assert_eq!(
             app.store.load().unwrap().generation.treble(),
-            TrebleExtension::AutoEq
+            TrebleExtension::Limited
         );
         assert_eq!(app.active.correction.name, "No correction");
     }
@@ -5435,6 +5496,21 @@ mod regression_tests {
             app.store.load().unwrap().generation,
             app.settings.generation
         );
+        app.action(Action::GenerationBass);
+        app.action(Action::GenerationConcha);
+        app.action(Action::GenerationCutLimit);
+        wait_for_preview(&mut app);
+        assert_eq!(app.settings.generation.bass(), BassExtension::Tapered);
+        assert_eq!(
+            app.settings.generation.concha(),
+            ConchaInterference::Present
+        );
+        assert_eq!(app.settings.generation.cut_limit(), Some(18.0));
+        assert_eq!(
+            app.store.load().unwrap().generation,
+            app.settings.generation
+        );
+        assert!(Arc::ptr_eq(&playing, &app.active.correction));
         let valid = app.settings.generation;
         app.action(Action::EditNumber(NumberField::Generation(
             GenerationParameter::LowUnity,
@@ -5451,13 +5527,13 @@ mod regression_tests {
                 .iter()
                 .any(|(_, action)| *action == Action::EditNumber(target))
         );
-        assert!(!app.hits.iter().any(|(_, action)| *action
+        assert!(app.hits.iter().any(|(_, action)| *action
             == Action::EditNumber(NumberField::Generation(GenerationParameter::HighUnity))));
         app.action(Action::GenerationDefaults);
         wait_for_preview(&mut app);
         assert_eq!(
             app.settings.generation,
-            GenerationSettings::default().with_treble(TrebleExtension::AutoEq)
+            GenerationSettings::default().with_treble(TrebleExtension::Limited)
         );
         assert_eq!(
             app.store.load().unwrap().generation,

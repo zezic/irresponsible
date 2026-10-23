@@ -32,8 +32,8 @@ impl FirLength {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Alignment {
-    #[default]
     MidrangeMean,
+    #[default]
     OneKhz,
     BroadbandMean,
 }
@@ -56,9 +56,23 @@ impl Alignment {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Normalization {
-    #[default]
     Raw,
+    #[default]
     Peak,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BassExtension {
+    #[default]
+    Extended,
+    Tapered,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConchaInterference {
+    #[default]
+    Absent,
+    Present,
 }
 impl Normalization {
     pub const ALL: [Self; 2] = [Self::Raw, Self::Peak];
@@ -75,22 +89,28 @@ pub enum GenerationParameter {
     Smoothing,
     TrebleSmoothing,
     TrebleStart,
+    TrebleEnd,
+    TrebleGain,
     BoostLimit,
     CutLimit,
     SlopeLimit,
+    SlopeDecay,
     LowUnity,
     LowFull,
     HighFull,
     HighUnity,
 }
 impl GenerationParameter {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::Smoothing,
         Self::TrebleSmoothing,
         Self::TrebleStart,
+        Self::TrebleEnd,
+        Self::TrebleGain,
         Self::BoostLimit,
         Self::CutLimit,
         Self::SlopeLimit,
+        Self::SlopeDecay,
         Self::LowUnity,
         Self::LowFull,
         Self::HighFull,
@@ -101,9 +121,12 @@ impl GenerationParameter {
             Self::Smoothing => "Smooth (oct)",
             Self::TrebleSmoothing => "Treble (oct)",
             Self::TrebleStart => "Treble from (Hz)",
+            Self::TrebleEnd => "Treble to (Hz)",
+            Self::TrebleGain => "Treble strength",
             Self::BoostLimit => "Boost limit (dB)",
             Self::CutLimit => "Cut limit (dB)",
             Self::SlopeLimit => "Slope (dB/oct)",
+            Self::SlopeDecay => "Slope decay",
             Self::LowUnity => "Low unity (Hz)",
             Self::LowFull => "Low full (Hz)",
             Self::HighFull => "High full (Hz)",
@@ -112,12 +135,15 @@ impl GenerationParameter {
     }
     pub fn bounds(self) -> RangeInclusive<f32> {
         match self {
-            Self::Smoothing => 1.0 / 48.0..=4.0,
+            Self::Smoothing => 1.0 / 24.0..=4.0,
             Self::TrebleSmoothing => 1.0 / 12.0..=4.0,
             Self::TrebleStart => 500.0..=16000.0,
+            Self::TrebleEnd => 1000.0..=20000.0,
+            Self::TrebleGain => 0.0..=1.0,
             Self::BoostLimit => 0.0..=24.0,
             Self::CutLimit => 0.0..=60.0,
             Self::SlopeLimit => 1.0..=48.0,
+            Self::SlopeDecay => 0.0..=1.0,
             Self::LowUnity => 1.0..=1000.0,
             Self::LowFull => 20.0..=2000.0,
             Self::HighFull => 1000.0..=18000.0,
@@ -128,7 +154,8 @@ impl GenerationParameter {
         match self {
             Self::Smoothing => 1.0 / 12.0,
             Self::TrebleSmoothing => 0.25,
-            Self::TrebleStart | Self::HighFull | Self::HighUnity => 500.0,
+            Self::TrebleStart | Self::TrebleEnd | Self::HighFull | Self::HighUnity => 500.0,
+            Self::TrebleGain | Self::SlopeDecay => 0.05,
             Self::BoostLimit => 0.5,
             Self::LowFull => 10.0,
             _ => 1.0,
@@ -144,12 +171,17 @@ struct GenerationDocument {
     fir_length: FirLength,
     alignment: Alignment,
     normalization: Normalization,
+    bass_extension: BassExtension,
+    concha_interference: ConchaInterference,
     smoothing_octaves: f32,
     treble_smoothing_octaves: f32,
     treble_start_hz: f32,
+    treble_end_hz: f32,
+    treble_gain: f32,
     boost_limit_db: f32,
-    cut_limit_db: f32,
+    cut_limit_db: Option<f32>,
     slope_limit_db_per_octave: f32,
+    slope_decay: f32,
     low_unity_hz: f32,
     low_full_hz: f32,
     high_full_hz: f32,
@@ -158,16 +190,21 @@ struct GenerationDocument {
 impl Default for GenerationDocument {
     fn default() -> Self {
         Self {
-            treble_extension: TrebleExtension::Limited,
+            treble_extension: TrebleExtension::AutoEq,
             fir_length: FirLength::default(),
             alignment: Alignment::default(),
             normalization: Normalization::default(),
-            smoothing_octaves: 1.0 / 3.0,
-            treble_smoothing_octaves: 1.0,
+            bass_extension: BassExtension::default(),
+            concha_interference: ConchaInterference::default(),
+            smoothing_octaves: 1.0 / 12.0,
+            treble_smoothing_octaves: 2.0,
             treble_start_hz: 6000.0,
+            treble_end_hz: 8000.0,
+            treble_gain: 1.0,
             boost_limit_db: 6.0,
-            cut_limit_db: 18.0,
-            slope_limit_db_per_octave: 12.0,
+            cut_limit_db: None,
+            slope_limit_db_per_octave: 18.0,
+            slope_decay: 0.0,
             low_unity_hz: 10.0,
             low_full_hz: 20.0,
             high_full_hz: 10000.0,
@@ -196,6 +233,9 @@ impl TryFrom<GenerationDocument> for GenerationSettings {
             }
         }
         let d = &settings.0;
+        if d.treble_start_hz >= d.treble_end_hz {
+            return Err(invalid("Treble transition requires from < to."));
+        }
         if !(d.low_unity_hz < d.low_full_hz
             && d.low_full_hz <= d.high_full_hz
             && d.high_full_hz < d.high_unity_hz)
@@ -219,9 +259,12 @@ impl GenerationSettings {
             GenerationParameter::Smoothing => d.smoothing_octaves,
             GenerationParameter::TrebleSmoothing => d.treble_smoothing_octaves,
             GenerationParameter::TrebleStart => d.treble_start_hz,
+            GenerationParameter::TrebleEnd => d.treble_end_hz,
+            GenerationParameter::TrebleGain => d.treble_gain,
             GenerationParameter::BoostLimit => d.boost_limit_db,
-            GenerationParameter::CutLimit => d.cut_limit_db,
+            GenerationParameter::CutLimit => d.cut_limit_db.unwrap_or(18.0),
             GenerationParameter::SlopeLimit => d.slope_limit_db_per_octave,
+            GenerationParameter::SlopeDecay => d.slope_decay,
             GenerationParameter::LowUnity => d.low_unity_hz,
             GenerationParameter::LowFull => d.low_full_hz,
             GenerationParameter::HighFull => d.high_full_hz,
@@ -234,9 +277,12 @@ impl GenerationSettings {
             GenerationParameter::Smoothing => d.smoothing_octaves = value,
             GenerationParameter::TrebleSmoothing => d.treble_smoothing_octaves = value,
             GenerationParameter::TrebleStart => d.treble_start_hz = value,
+            GenerationParameter::TrebleEnd => d.treble_end_hz = value,
+            GenerationParameter::TrebleGain => d.treble_gain = value,
             GenerationParameter::BoostLimit => d.boost_limit_db = value,
-            GenerationParameter::CutLimit => d.cut_limit_db = value,
+            GenerationParameter::CutLimit => d.cut_limit_db = Some(value),
             GenerationParameter::SlopeLimit => d.slope_limit_db_per_octave = value,
+            GenerationParameter::SlopeDecay => d.slope_decay = value,
             GenerationParameter::LowUnity => d.low_unity_hz = value,
             GenerationParameter::LowFull => d.low_full_hz = value,
             GenerationParameter::HighFull => d.high_full_hz = value,
@@ -271,6 +317,30 @@ impl GenerationSettings {
     pub fn normalization(self) -> Normalization {
         self.0.normalization
     }
+    pub fn bass(self) -> BassExtension {
+        self.0.bass_extension
+    }
+    #[must_use]
+    pub fn with_bass(mut self, bass: BassExtension) -> Self {
+        self.0.bass_extension = bass;
+        self
+    }
+    pub fn concha(self) -> ConchaInterference {
+        self.0.concha_interference
+    }
+    #[must_use]
+    pub fn with_concha(mut self, concha: ConchaInterference) -> Self {
+        self.0.concha_interference = concha;
+        self
+    }
+    pub fn cut_limit(self) -> Option<f32> {
+        self.0.cut_limit_db
+    }
+    #[must_use]
+    pub fn without_cut_limit(mut self) -> Self {
+        self.0.cut_limit_db = None;
+        self
+    }
     #[must_use]
     pub fn with_normalization(mut self, normalization: Normalization) -> Self {
         self.0.normalization = normalization;
@@ -282,25 +352,9 @@ impl GenerationSettings {
         Self::default().with_treble(self.treble())
     }
     pub fn policy(self) -> String {
-        if self == self.reset_parameters() {
-            return self.treble().policy().into();
-        }
         format!(
-            "IRresponsible v3: smoothing {} / {} octaves from {} Hz; boost +{} / cut -{} dB; {} dB/octave; {}-{} Hz low taper, {}-{} Hz high taper; {:?} treble; {:?} alignment; {:?} gain; {}-point real-cepstrum minimum phase",
-            self.0.smoothing_octaves,
-            self.0.treble_smoothing_octaves,
-            self.0.treble_start_hz,
-            self.0.boost_limit_db,
-            self.0.cut_limit_db,
-            self.0.slope_limit_db_per_octave,
-            self.0.low_unity_hz,
-            self.0.low_full_hz,
-            self.0.high_full_hz,
-            self.0.high_unity_hz,
-            self.treble(),
-            self.alignment(),
-            self.normalization(),
-            self.length().frames()
+            "IRresponsible v4: AutoEq 7ae0f56 correction and minimum-phase FIR; {}",
+            serde_json::to_string(&self.0).expect("validated generation settings serialize")
         )
     }
 }

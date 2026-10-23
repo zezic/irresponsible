@@ -15,7 +15,14 @@ impl Action {
             Self::GenerationNormalization => {
                 "Raw keeps calculated gain; Peak caps the filter response at -0.2 dB."
             }
-            Self::TrebleExtension => "Extends treble correction and adds AutoEq-style rolloff.",
+            Self::TrebleExtension => "Extends treble correction; disable to taper it to zero dB.",
+            Self::GenerationBass => {
+                "Fade bass correction to zero dB below the full-correction frequency."
+            }
+            Self::GenerationCutLimit => "Apply an optional maximum cut after AutoEq equalization.",
+            Self::GenerationConcha => {
+                "Limit correction of the 8-11.5 kHz dip caused by concha interference in some measurement rigs."
+            }
             Self::GenerationDefaults => {
                 "Resets IR parameters while keeping AutoEq treble unchanged."
             }
@@ -85,13 +92,22 @@ impl NumberField {
             }
             Self::Generation(parameter) => match parameter {
                 GenerationParameter::Smoothing => {
-                    "Correction averaging width in octaves. Higher values reduce narrow adjustments."
+                    "Savitzky-Golay smoothing width in octaves. Higher values reduce narrow adjustments."
                 }
                 GenerationParameter::TrebleSmoothing => {
-                    "Averaging width above 'Treble from'. Higher values soften treble corrections."
+                    "Treble smoothing width in octaves, blended across the treble transition."
                 }
                 GenerationParameter::TrebleStart => {
-                    "Frequency where treble smoothing replaces normal smoothing."
+                    "Lower boundary of the sigmoid transition to treble smoothing."
+                }
+                GenerationParameter::TrebleEnd => {
+                    "Upper boundary of the sigmoid transition to treble smoothing."
+                }
+                GenerationParameter::TrebleGain => {
+                    "Treble correction strength: zero disables it and one applies it fully."
+                }
+                GenerationParameter::SlopeDecay => {
+                    "Fraction by which the slope limit decays per octave within a limited region."
                 }
                 GenerationParameter::BoostLimit => {
                     "Maximum correction boost. Lower values need less headroom."
@@ -100,7 +116,7 @@ impl NumberField {
                     "Maximum correction cut, entered as a positive dB value."
                 }
                 GenerationParameter::SlopeLimit => {
-                    "Maximum correction change per octave. Lower values produce gentler curves."
+                    "Maximum rising correction slope per octave outside protected cut regions, before final smoothing."
                 }
                 GenerationParameter::LowUnity => "Below this frequency, correction is zero dB.",
                 GenerationParameter::LowFull => {
