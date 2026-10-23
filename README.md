@@ -6,29 +6,19 @@ Headphone correction for macOS: find your headphones in AutoEq, load a correctio
 
 ![IRresponsible headphone correction interface](assets/screenshot.png)
 
-## Install the prerequisites
+## Install
 
-- **macOS 13 or later**, with audio devices at **44.1 or 48 kHz**.
-- **[BlackHole 2ch](https://existential.audio/blackhole/)**: use the official installer and restart if prompted. With Homebrew: `brew install --cask blackhole-2ch`.
-- **[Rust](https://rust-lang.org/tools/install/)**: install the current stable toolchain with rustup:
+Requires **macOS 13 or later**, audio devices at **44.1 or 48 kHz**, and **[BlackHole 2ch](https://existential.audio/blackhole/)**. Use BlackHole's official installer and restart if prompted, or run `brew install --cask blackhole-2ch`.
 
-  ```sh
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  . "$HOME/.cargo/env"
-  ```
-
-- **Apple Command Line Tools**: run `xcode-select --install` if they are not installed.
-
-## Build the app
+Quit IRresponsible before updating, then run:
 
 ```sh
-git clone https://github.com/zezic/irresponsible.git
-cd irresponsible
-bash scripts/package.sh
-open dist/IRresponsible.app
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/zezic/irresponsible/master/scripts/install.sh | bash
 ```
 
-Packaging creates `dist/IRresponsible.app` with its icon and resources, signed locally. Copy it to Applications if you want to keep it there. Rust is needed to build, not to run the packaged app.
+The installer downloads the latest release for your Mac, verifies its checksum and app signature, installs to `~/Applications`, and removes quarantine. Builds are ad-hoc signed and are not notarized yet. To choose a different folder, append `-s -- --directory /Applications` after `bash`.
+
+You can also download the **arm64** (Apple Silicon) or **x86_64** (Intel) archive from [Releases](https://github.com/zezic/irresponsible/releases).
 
 ## First listen
 
@@ -39,4 +29,17 @@ Packaging creates `dist/IRresponsible.app` with its icon and resources, signed l
 
 Closing the window keeps audio running. **Stop** or **Quit** restores the previous output when the app owns the route. If audio goes silent after a crash, choose your headphones or interface in macOS Sound settings.
 
-[Technical reference](SPEC.md) · [AutoEq catalogue and measurements](https://github.com/jaakkopasanen/AutoEq)
+## Build from source
+
+Install [Rust](https://rust-lang.org/tools/install/) with `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`, then restart your terminal. Install Apple's Command Line Tools with `xcode-select --install` if needed.
+
+```sh
+git clone https://github.com/zezic/irresponsible.git
+cd irresponsible
+bash scripts/package.sh
+open dist/IRresponsible.app
+```
+
+The packaged app includes its icon, resources, and local signature. Rust is needed to build, not to run it.
+
+[Technical and release reference](SPEC.md) · [AutoEq catalogue and measurements](https://github.com/jaakkopasanen/AutoEq)

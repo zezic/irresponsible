@@ -339,7 +339,7 @@ impl Source {
             client: Client::builder()
                 .timeout(Duration::from_secs(25))
                 .connect_timeout(Duration::from_secs(8))
-                .user_agent("IRresponsible/0.1")
+                .user_agent(concat!("IRresponsible/", env!("CARGO_PKG_VERSION")))
                 .build()?,
             store,
         })

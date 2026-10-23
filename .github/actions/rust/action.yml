@@ -1,0 +1,20 @@
+name: macOS Rust environment
+description: Configure the macOS deployment target, Rust toolchain, and build caches.
+runs:
+  using: composite
+  steps:
+    - name: Set macOS deployment target
+      shell: bash
+      run: |
+        minimum_os="$(plutil -extract LSMinimumSystemVersion raw assets/Info.plist)"
+        printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "$minimum_os" >> "$GITHUB_ENV"
+    - name: Install Rust
+      shell: bash
+      run: |
+        rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+        rustup default stable
+    - name: Cache Rust builds
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        env-vars: MACOSX_DEPLOYMENT_TARGET
+        save-if: ${{ github.event_name == 'push' }}

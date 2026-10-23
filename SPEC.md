@@ -69,3 +69,20 @@ cargo fmt --check
 ```
 
 Unit and integration tests cover DSP/gain contracts, upstream fixtures, preparation/activation, persistence, UI interactions, spectrum analysis, and frame scheduling. Hardware-dependent tests are explicitly marked ignored for ordinary runs. The `alloc-audit` feature checks callback allocations; CLI probes and offscreen renders exercise native audio and UI paths separately.
+
+## CI and releases
+
+[Build and release](.github/workflows/build.yml) checks formatting and Clippy, runs tests with all features on Apple Silicon and Intel, packages both native apps, and exercises the installer without making network requests or opening the app. Hardware-dependent tests remain excluded. Normal pushes to master, pull requests, and manual runs upload build archives as Actions artifacts.
+
+For a release, update `package.version` in Cargo.toml and its Cargo.lock entry, commit and push, then create and push the matching version tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Replace `0.1.0` with the committed Cargo version. A mismatched tag fails before builds start. Prerelease versions such as `0.2.0-rc.1` produce GitHub prereleases. The macOS marketing version uses the numeric version core; the CI run number supplies the bundle build number. The package's full Cargo version is retained in its info string and network user agent.
+
+Only a tag push publishes a release, after both architecture builds succeed. It uploads versioned `.zip` apps and `SHA256SUMS` using the workflow token; no personal token is needed. Releases are assembled as drafts before publication. Rerunning a failed draft upload is supported; already-published releases are left unchanged. The release job alone receives contents-write permission.
+
+[scripts/install.sh](scripts/install.sh) downloads the latest stable release for the current Mac architecture, verifies its SHA-256 checksum, bundle identity/version, and ad-hoc signature, then removes quarantine from that app and installs it to `~/Applications`. `--directory` overrides the destination. A running app must be quit first. Failed verification preserves an existing installation, and interrupted replacement restores its backup. The installer does not start the app. [scripts/test-installer.sh](scripts/test-installer.sh) exercises installation, checksum/version rejection, replacement rollback, and running-app protection against a local, quarantined archive fixture.
