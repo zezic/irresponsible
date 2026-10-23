@@ -1,0 +1,46 @@
+{
+  "crinacle/GRAS 43AG-7 over-ear/Beyerdynamic DT 990 Pro (250 Ohm)": [
+    {
+      "AutoEq": "Hz44100"
+    },
+    {
+      "AutoEq": "Hz48000"
+    }
+  ],
+  "oratory1990/over-ear/Beyerdynamic DT 990 Pro": [
+    {
+      "AutoEq": "Hz44100"
+    },
+    {
+      "AutoEq": "Hz48000"
+    },
+    "Measurements"
+  ],
+  "Auriculares Argentina/over-ear/Beyerdynamic DT 990 Pro (250 Ohm)": [
+    {
+      "AutoEq": "Hz44100"
+    },
+    {
+      "AutoEq": "Hz48000"
+    },
+    "Measurements"
+  ],
+  "HypetheSonics/Bruel & Kjaer 5128 in-ear/1MORE Quad Driver": [
+    {
+      "AutoEq": "Hz44100"
+    },
+    {
+      "AutoEq": "Hz48000"
+    },
+    "Measurements"
+  ],
+  "HypetheSonics/over-ear/Audeze LCD-4": [
+    {
+      "AutoEq": "Hz44100"
+    },
+    {
+      "AutoEq": "Hz48000"
+    },
+    "Measurements"
+  ]
+}

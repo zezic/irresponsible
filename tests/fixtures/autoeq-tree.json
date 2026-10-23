@@ -1,0 +1,45 @@
+{
+  "truncated": false,
+  "tree": [
+    {
+      "path": "crinacle/GRAS 43AG-7 over-ear/Beyerdynamic DT 990 Pro (250 Ohm)/Beyerdynamic DT 990 Pro (250 Ohm) minimum phase 44100Hz.wav",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "a37f173887c7bd24f15fb223c76a6b6471e1491e",
+      "size": 18044,
+      "url": "https://api.github.com/repos/jaakkopasanen/AutoEq/git/blobs/a37f173887c7bd24f15fb223c76a6b6471e1491e"
+    },
+    {
+      "path": "crinacle/GRAS 43AG-7 over-ear/Beyerdynamic DT 990 Pro (250 Ohm)/Beyerdynamic DT 990 Pro (250 Ohm) minimum phase 48000Hz.wav",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "d5529dc4f8e56debfa36c7dc397f3431d258973f",
+      "size": 19244,
+      "url": "https://api.github.com/repos/jaakkopasanen/AutoEq/git/blobs/d5529dc4f8e56debfa36c7dc397f3431d258973f"
+    },
+    {
+      "path": "oratory1990/over-ear/Beyerdynamic DT 990 Pro/Beyerdynamic DT 990 Pro minimum phase 44100Hz.wav",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "de2006e7c2bd4afcba4ddf3219fe544b5995c311",
+      "size": 18044,
+      "url": "https://api.github.com/repos/jaakkopasanen/AutoEq/git/blobs/de2006e7c2bd4afcba4ddf3219fe544b5995c311"
+    },
+    {
+      "path": "oratory1990/over-ear/Beyerdynamic DT 990 Pro/Beyerdynamic DT 990 Pro minimum phase 48000Hz.wav",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "8ac860997a158a520f760356d20de72c2b17c9ef",
+      "size": 19244,
+      "url": "https://api.github.com/repos/jaakkopasanen/AutoEq/git/blobs/8ac860997a158a520f760356d20de72c2b17c9ef"
+    },
+    {
+      "path": "oratory1990/over-ear/Beyerdynamic DT 990 Pro/Beyerdynamic DT 990 Pro.csv",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "4a8dbf7308406ae66f424e55b4f59574890ea1e5",
+      "size": 42704,
+      "url": "https://api.github.com/repos/jaakkopasanen/AutoEq/git/blobs/4a8dbf7308406ae66f424e55b4f59574890ea1e5"
+    }
+  ]
+}
