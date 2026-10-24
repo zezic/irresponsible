@@ -8,6 +8,8 @@ pub(super) const DELAY: Duration = Duration::from_millis(400);
 impl Action {
     fn help(self) -> Option<&'static str> {
         Some(match self {
+            Self::Room(action) => return action.help(),
+            Self::ValueBar(ValueBar::Room(bar)) => bar.parameter().help(),
             Self::GenerationLength => "Filter length. More taps resolve bass more precisely.",
             Self::GenerationAlignment => {
                 "Matches measurement and target levels before calculating correction."
@@ -66,7 +68,9 @@ impl Action {
                 ThemeSlot::Fixed => "Theme to use regardless of macOS appearance.",
             },
             Self::Capture => "Device receiving Mac audio, usually BlackHole.",
-            Self::Playback => "Device sending processed audio to your headphones.",
+            Self::Playback => {
+                "Playback device. Stop listening before changing the device or output channels."
+            }
             Self::CapturePair => "The stereo channels captured from the input device.",
             Self::PlaybackPair => "The stereo output channels used for playback.",
             Self::CatalogFilter => {
@@ -84,6 +88,7 @@ impl Action {
 impl NumberField {
     fn help(self) -> &'static str {
         match self {
+            Self::Room(parameter) => parameter.help(),
             Self::ComparisonTrim => {
                 "Adjusts corrected audio relative to bypass for loudness comparisons."
             }

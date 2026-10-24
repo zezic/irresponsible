@@ -30,28 +30,50 @@ impl TryFrom<u32> for Rate {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct DeviceUid(cpal::DeviceId);
-
-impl DeviceUid {
-    pub fn new(id: cpal::DeviceId) -> Self {
-        Self(id)
-    }
-    pub fn id(&self) -> &cpal::DeviceId {
-        &self.0
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmulatedDevice {
+    Capture,
+    Speakers,
+    Microphone,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DeviceUid {
+    Hardware(#[serde(with = "hardware_uid")] cpal::DeviceId),
+    Emulated { emulated: EmulatedDevice },
+}
+mod hardware_uid {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(id: &cpal::DeviceId, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&id.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<cpal::DeviceId, D::Error> {
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+impl DeviceUid {
+    pub fn new(id: cpal::DeviceId) -> Self {
+        Self::Hardware(id)
+    }
+    pub fn id(&self) -> &cpal::DeviceId {
+        match self {
+            Self::Hardware(id) => id,
+            Self::Emulated { .. } => panic!("emulated endpoints belong to their I/O provider"),
+        }
+    }
+}
 impl TryFrom<String> for DeviceUid {
     type Error = cpal::Error;
     fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-        value.parse().map(Self)
+        value.parse().map(Self::Hardware)
     }
 }
 impl From<DeviceUid> for String {
     fn from(value: DeviceUid) -> Self {
-        value.0.to_string()
+        value.id().to_string()
     }
 }
 
@@ -94,11 +116,25 @@ impl From<StereoPair> for [u16; 2] {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Endpoint {
+pub struct Endpoint<C = StereoPair> {
     pub uid: DeviceUid,
     pub label: String,
-    pub pair: StereoPair,
+    #[serde(alias = "pair")]
+    pub channels: C,
 }
+
+/// A single input channel; input and output indices are separate namespaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonoChannel(pub u16);
+impl MonoChannel {
+    pub fn validate(self, channels: u16) -> Result<()> {
+        if self.0 >= channels {
+            return Err(invalid("Microphone channel exceeds input channel count"));
+        }
+        Ok(())
+    }
+}
+pub type Microphone = Endpoint<MonoChannel>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Route {
@@ -107,7 +143,9 @@ pub struct Route {
 }
 impl Route {
     pub fn validate(&self) -> Result<()> {
-        if self.capture.uid == self.playback.uid && self.capture.pair.overlaps(self.playback.pair) {
+        if self.capture.uid == self.playback.uid
+            && self.capture.channels.overlaps(self.playback.channels)
+        {
             return Err(invalid(
                 "Feedback route: capture and playback overlap. Use a distinct virtual device or non-overlapping stereo pairs.",
             ));
@@ -237,6 +275,9 @@ pub enum Lifecycle {
     Running {
         rate: Rate,
         estimated_latency_ms: f64,
+    },
+    Measuring {
+        rate: Rate,
     },
     Recovering {
         attempt: RecoveryAttempt,

@@ -10,6 +10,47 @@ fn main() {
 
 fn run() -> irresponsible::error::Result<()> {
     match std::env::args().nth(1).as_deref() {
+        Some("--simulate") => ui::run_simulated(),
+        Some("--simulate-smoke") | Some("--simulate-smoke-spatial") => {
+            let path = std::env::args().nth(2).ok_or_else(|| {
+                irresponsible::error::invalid("--simulate-smoke requires an output directory")
+            })?;
+            let mut layout = irresponsible::measurement::Layout::default();
+            if std::env::args().nth(1).as_deref() == Some("--simulate-smoke-spatial") {
+                layout.positions.push(irresponsible::measurement::Position {
+                    name: "Side position".into(),
+                    coordinates_cm: Some([25.0, 0.0, 0.0]),
+                    weight: 1.0,
+                });
+                layout.order.push(1);
+            }
+            ui::room_smoke(std::path::Path::new(&path), layout)
+        }
+        Some("--room-simulate") | Some("--room-simulate-realtime") => {
+            let directory = tempfile::tempdir()?;
+            let store = irresponsible::storage::Store::at(directory.path())?;
+            let mut scenario = std::env::args()
+                .nth(3)
+                .map(|path| {
+                    irresponsible::measurement::simulation::Scenario::load(std::path::Path::new(
+                        &path,
+                    ))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if std::env::args().nth(1).as_deref() == Some("--room-simulate-realtime") {
+                scenario.pace = irresponsible::measurement::simulation::Pace::RealTime;
+            }
+            let id = irresponsible::measurement::validation::run(scenario, &store)?;
+            if let Some(destination) = std::env::args().nth(2) {
+                irresponsible::measurement::workflow::export_session(
+                    id,
+                    std::path::Path::new(&destination),
+                    &store,
+                )?;
+            }
+            Ok(())
+        }
         Some("--login-status") => {
             println!("{:?}", irresponsible::platform::login::status()?);
             Ok(())

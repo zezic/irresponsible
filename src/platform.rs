@@ -1,9 +1,11 @@
 //! macOS audio routing, device notifications, and login-item management.
 pub mod login;
+mod power;
 use crate::{
     domain::DeviceUid,
     error::{Result, invalid},
 };
+pub use power::SleepMonitor;
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -88,23 +90,20 @@ mod mac {
         }
         Ok(unsafe { CFString::wrap_under_create_rule(string) }.to_string())
     }
-    fn devices() -> Result<Vec<u32>> {
-        let property = address(kAudioHardwarePropertyDevices);
+    fn object_ids(object: u32, selector: u32) -> Result<Vec<u32>> {
+        let property = address(selector);
         let mut bytes = 0;
         // SAFETY: Core Audio reports the byte length of its AudioDeviceID array.
         checked(unsafe {
-            AudioObjectGetPropertyDataSize(
-                kAudioObjectSystemObject,
-                &property,
-                0,
-                ptr::null(),
-                &mut bytes,
-            )
+            AudioObjectGetPropertyDataSize(object, &property, 0, ptr::null(), &mut bytes)
         })?;
+        if !(bytes as usize).is_multiple_of(size_of::<u32>()) {
+            return Err(invalid("Core Audio returned a malformed object ID array"));
+        }
         let mut devices = vec![0; bytes as usize / size_of::<u32>()];
         checked(unsafe {
             AudioObjectGetPropertyData(
-                kAudioObjectSystemObject,
+                object,
                 &property,
                 0,
                 ptr::null(),
@@ -115,13 +114,19 @@ mod mac {
         devices.truncate(bytes as usize / size_of::<u32>());
         Ok(devices)
     }
+    fn devices() -> Result<Vec<u32>> {
+        object_ids(kAudioObjectSystemObject, kAudioHardwarePropertyDevices)
+    }
     fn device_by_uid(selected: &str) -> Result<u32> {
         devices()?
             .into_iter()
             .find(|&device| uid(device).is_ok_and(|uid| uid == selected))
-            .ok_or_else(|| invalid("Selected Core Audio UID is unavailable"))
+            .ok_or_else(|| invalid(format!("Core Audio device UID {selected} is unavailable")))
     }
 
+    pub fn output_is(uid: &DeviceUid) -> Result<bool> {
+        Ok(default_device()? == device_by_uid(uid.id().id())?)
+    }
     pub fn is_virtual_device(uid: &DeviceUid) -> Result<bool> {
         let device = device_by_uid(uid.id().id())?;
         let transport: u32 = read(device, kAudioDevicePropertyTransportType)?;
@@ -130,25 +135,30 @@ mod mac {
 
     struct PropertyListener<T> {
         value: Option<Box<T>>,
-        selector: u32,
+        object: u32,
+        property: AudioObjectPropertyAddress,
         callback: AudioObjectPropertyListenerProc,
     }
     impl<T> PropertyListener<T> {
         fn new(selector: u32, value: T, callback: AudioObjectPropertyListenerProc) -> Result<Self> {
+            Self::on(kAudioObjectSystemObject, address(selector), value, callback)
+        }
+        fn on(
+            object: u32,
+            property: AudioObjectPropertyAddress,
+            value: T,
+            callback: AudioObjectPropertyListenerProc,
+        ) -> Result<Self> {
             let mut value = Box::new(value);
             let context = (&mut *value as *mut T).cast();
             // SAFETY: the heap address remains stable until the listener is removed.
             checked(unsafe {
-                AudioObjectAddPropertyListener(
-                    kAudioObjectSystemObject,
-                    &address(selector),
-                    callback,
-                    context,
-                )
+                AudioObjectAddPropertyListener(object, &property, callback, context)
             })?;
             Ok(Self {
                 value: Some(value),
-                selector,
+                object,
+                property,
                 callback,
             })
         }
@@ -160,8 +170,8 @@ mod mac {
             // SAFETY: the context still exists while Core Audio removes the callback.
             let status = unsafe {
                 AudioObjectRemovePropertyListener(
-                    kAudioObjectSystemObject,
-                    &address(self.selector),
+                    self.object,
+                    &self.property,
                     self.callback,
                     context,
                 )
@@ -218,6 +228,15 @@ mod mac {
                 listener,
             }))
         }
+        pub fn owns(&self) -> bool {
+            !self
+                .listener
+                .value
+                .as_ref()
+                .expect("registered output lease")
+                .lost
+                .load(Ordering::Relaxed)
+        }
         pub fn restore(&mut self) -> Result<()> {
             let watch = self
                 .listener
@@ -247,42 +266,142 @@ mod mac {
         unsafe { &*context.cast::<AtomicU64>() }.fetch_add(1, Ordering::Relaxed);
         0
     }
-    pub struct DeviceMonitor {
+    struct RevisionWatch {
         listener: PropertyListener<AtomicU64>,
         observed: u64,
     }
-    impl DeviceMonitor {
-        pub fn new() -> Result<Self> {
+    impl RevisionWatch {
+        fn new(object: u32, property: AudioObjectPropertyAddress) -> Result<Self> {
             Ok(Self {
-                listener: PropertyListener::new(
-                    kAudioHardwarePropertyDevices,
+                listener: PropertyListener::on(
+                    object,
+                    property,
                     AtomicU64::new(0),
                     Some(devices_changed),
                 )?,
                 observed: 0,
             })
         }
-        pub fn changed(&mut self) -> bool {
+        fn changed(&mut self) -> bool {
             let revision = self
                 .listener
                 .value
                 .as_ref()
-                .expect("registered device listener")
+                .expect("registered property listener")
                 .load(Ordering::Relaxed);
             let changed = revision != self.observed;
             self.observed = revision;
             changed
         }
     }
+    pub struct DeviceMonitor {
+        system: RevisionWatch,
+        route: RevisionWatch,
+        endpoints: Vec<RevisionWatch>,
+        watched_devices: Vec<u32>,
+    }
+    impl DeviceMonitor {
+        pub fn new() -> Result<Self> {
+            Ok(Self {
+                system: RevisionWatch::new(
+                    kAudioObjectSystemObject,
+                    address(kAudioHardwarePropertyDevices),
+                )?,
+                route: RevisionWatch::new(
+                    kAudioObjectSystemObject,
+                    address(kAudioHardwarePropertyDefaultOutputDevice),
+                )?,
+                endpoints: Vec::new(),
+                watched_devices: Vec::new(),
+            })
+        }
+        pub fn watch(&mut self, endpoints: &[&DeviceUid]) -> Result<()> {
+            let mut devices = Vec::new();
+            let mut watches = Vec::new();
+            for endpoint in endpoints {
+                let device = device_by_uid(endpoint.id().id())?;
+                if devices.contains(&device) {
+                    continue;
+                }
+                devices.push(device);
+                for selector in [
+                    kAudioDevicePropertyNominalSampleRate,
+                    kAudioDevicePropertyDeviceIsAlive,
+                ] {
+                    watches.push(RevisionWatch::new(device, address(selector))?);
+                }
+                let control_list = address(kAudioObjectPropertyControlList);
+                // SAFETY: this queries property presence without reading data.
+                if unsafe { AudioObjectHasProperty(device, &control_list) } != 0 {
+                    for control in object_ids(device, kAudioObjectPropertyControlList)? {
+                        for selector in [
+                            kAudioLevelControlPropertyScalarValue,
+                            kAudioLevelControlPropertyDecibelValue,
+                            kAudioBooleanControlPropertyValue,
+                            kAudioSelectorControlPropertyCurrentItem,
+                        ] {
+                            let property = address(selector);
+                            // SAFETY: control IDs came from this device; unsupported classes are skipped.
+                            if unsafe { AudioObjectHasProperty(control, &property) } != 0 {
+                                watches.push(RevisionWatch::new(control, property)?);
+                            }
+                        }
+                    }
+                }
+                for scope in [
+                    kAudioObjectPropertyScopeInput,
+                    kAudioObjectPropertyScopeOutput,
+                ] {
+                    let mut property = address(kAudioDevicePropertyStreamConfiguration);
+                    property.mScope = scope;
+                    // SAFETY: the address is a valid selector/scope pair; no data is read.
+                    if unsafe { AudioObjectHasProperty(device, &property) } != 0 {
+                        watches.push(RevisionWatch::new(device, property)?);
+                    }
+                }
+            }
+            self.endpoints = watches;
+            self.watched_devices = devices;
+            Ok(())
+        }
+        pub fn changed(&mut self) -> bool {
+            self.endpoints.iter_mut().fold(
+                self.system.changed() | self.route.changed(),
+                |changed, watch| watch.changed() || changed,
+            )
+        }
+        /// Observe the selected path without treating unrelated hotplug as a fault.
+        pub fn watched_changed(&mut self) -> Result<bool> {
+            let inventory_changed = self.system.changed();
+            let changed = self
+                .endpoints
+                .iter_mut()
+                .fold(self.route.changed(), |changed, watch| {
+                    watch.changed() || changed
+                });
+            if inventory_changed {
+                let available = devices()?;
+                return Ok(changed
+                    || self
+                        .watched_devices
+                        .iter()
+                        .any(|id| !available.contains(id)));
+            }
+            Ok(changed)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{DefaultOutputLease, DeviceMonitor, is_virtual_device};
+pub use mac::{DefaultOutputLease, DeviceMonitor, is_virtual_device, output_is};
 
 #[cfg(not(target_os = "macos"))]
 pub struct DefaultOutputLease;
 #[cfg(not(target_os = "macos"))]
 impl DefaultOutputLease {
+    pub fn owns(&self) -> bool {
+        true
+    }
     pub fn acquire(_: &DeviceUid) -> Result<Option<Self>> {
         Err(invalid("System output selection is supported on macOS"))
     }
@@ -295,10 +414,21 @@ impl DefaultOutputLease {
 pub struct DeviceMonitor;
 #[cfg(not(target_os = "macos"))]
 impl DeviceMonitor {
+    pub fn watch(&mut self, _: &[&DeviceUid]) -> Result<()> {
+        Ok(())
+    }
     pub fn new() -> Result<Self> {
         Ok(Self)
     }
     pub fn changed(&mut self) -> bool {
         false
     }
+    pub fn watched_changed(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn output_is(_: &DeviceUid) -> Result<bool> {
+    Err(invalid("System output routing is supported on macOS"))
 }

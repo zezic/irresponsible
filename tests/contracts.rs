@@ -218,17 +218,9 @@ fn literal_flat_and_harman_are_distinct_against_upstream_measurements() {
             settings,
         )
         .unwrap();
-        assert_eq!(flat_ir.target, Target::Flat);
-        assert_eq!(harman_ir.target, Target::Harman);
-        assert!(
-            flat_ir
-                .target_curve
-                .as_ref()
-                .unwrap()
-                .db
-                .iter()
-                .all(|&v| v == 0.0)
-        );
+        assert_eq!(flat_ir.target(), Target::Flat);
+        assert_eq!(harman_ir.target(), Target::Harman);
+        assert!(flat_ir.target_curve().unwrap().db.iter().all(|&v| v == 0.0));
         let coefficients = &flat_ir.channels[0];
         let bins = spectrum(coefficients, coefficients.len());
         for hz in [30.0_f32, 100.0, 1000.0, 3000.0, 8000.0, 18000.0] {
@@ -290,7 +282,7 @@ fn wav_import_keeps_channel_order_gain_leading_delay_and_tail() {
     )
     .unwrap();
     assert_eq!(ir.channels, [vec![0.0, 2.0, 0.1], vec![0.0, -0.4, 0.3]]);
-    assert_eq!(ir.target, Target::Custom);
+    assert_eq!(ir.target(), Target::Custom);
     assert!(
         serde_json::to_value(&ir).unwrap()["origin"]["Imported"]
             .get("original_rate")
@@ -406,16 +398,16 @@ fn feedback_is_rejected_but_disjoint_virtual_pairs_are_valid() {
     let endpoint = Endpoint {
         uid: DeviceUid::new(cpal::DeviceId::new(cpal::default_host().id(), "test")),
         label: "test".into(),
-        pair: StereoPair::default(),
+        channels: StereoPair::default(),
     };
     let mut route = Route {
         capture: endpoint.clone(),
         playback: endpoint,
     };
     assert!(route.validate().is_err());
-    route.playback.pair = StereoPair::try_from([2, 3]).unwrap();
+    route.playback.channels = StereoPair::try_from([2, 3]).unwrap();
     assert!(route.validate().is_ok());
-    assert!(route.playback.pair.validate(2).is_err());
+    assert!(route.playback.channels.validate(2).is_err());
 }
 
 #[test]
@@ -433,9 +425,9 @@ fn published_profiles_keep_gain_and_provenance_when_prepared_at_another_rate() {
         "crinacle".into(),
     );
     assert_eq!(published.channels, channels);
-    assert_eq!(published.target, Target::AutoEq);
+    assert_eq!(published.target(), Target::AutoEq);
     let converted = published.at_rate(Rate::Hz48000, &store).unwrap();
-    assert_eq!(converted.target, Target::AutoEq);
+    assert_eq!(converted.target(), Target::AutoEq);
     assert!(matches!(
         converted.origin,
         irresponsible::correction::Origin::PublishedAutoEq { .. }
@@ -518,12 +510,12 @@ fn documented_rig_families_generate_their_own_reference_targets_at_both_rates() 
                     .unwrap();
                     ir.validate().unwrap();
                     assert!(ir.response(64)[0].db.iter().all(|db| db.is_finite()));
-                    if ir.target != Target::Flat {
+                    if ir.target() != Target::Flat {
                         let Origin::AutoEq { target, .. } = &ir.origin else {
                             panic!("generated origin")
                         };
                         assert_eq!(target, &catalog.target(entry, kind).unwrap().description());
-                        assert_eq!(ir.target, kind);
+                        assert_eq!(ir.target(), kind);
                     }
                 }
             }
@@ -614,7 +606,7 @@ fn treble_extension_preserves_high_frequency_cuts_and_survives_save_and_rate_cha
     let regenerated = old
         .regenerate(Rate::Hz48000, GenerationSettings::default())
         .unwrap();
-    assert!(regenerated.measured.as_ref().unwrap().at(1000.0).abs() < 0.001);
+    assert!(regenerated.measured().unwrap().at(1000.0).abs() < 0.001);
     assert!(!regenerated.requires_regeneration());
     assert!(matches!(
         old.origin,
@@ -718,8 +710,8 @@ fn custom_generation_changes_the_impulse_and_keeps_its_recipe_across_rates() {
     };
     let ir = prepare(settings);
     assert_eq!(ir.channels[0].len(), 4096);
-    assert!(ir.measured.as_ref().unwrap().at(1000.0).abs() < 0.001);
-    assert!(ir.target_curve.as_ref().unwrap().at(1000.0).abs() < 0.001);
+    assert!(ir.measured().unwrap().at(1000.0).abs() < 0.001);
+    assert!(ir.target_curve().unwrap().at(1000.0).abs() < 0.001);
     let peak = spectrum(&ir.channels[0], ir.channels[0].len())
         .into_iter()
         .map(|bin| gain_db(bin.norm()))

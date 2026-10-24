@@ -1934,6 +1934,7 @@ name = "irresponsible"
 version = "0.2.0"
 dependencies = [
  "arboard",
+ "block2 0.6.2",
  "core-foundation 0.10.1",
  "coreaudio-sys",
  "cpal",

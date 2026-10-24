@@ -634,8 +634,10 @@ pub fn generate(
         name: entry.name.clone(),
         rate,
         channels: [coefficients.clone(), coefficients],
-        target,
         origin: Origin::AutoEq {
+            target_kind: target.try_into()?,
+            measured,
+            target_curve,
             revision: revision.to_owned(),
             path: entry.path.clone(),
             reference,
@@ -645,8 +647,6 @@ pub fn generate(
             policy: generation.policy(),
             generation,
         },
-        measured: Some(measured),
-        target_curve: Some(target_curve),
     };
     ir.validate()?;
     Ok(ir)

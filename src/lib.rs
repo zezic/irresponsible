@@ -8,6 +8,7 @@ pub mod domain;
 pub mod dsp;
 pub mod error;
 pub mod frame_schedule;
+pub mod measurement;
 pub mod platform;
 pub mod spectrum;
 pub mod storage;

@@ -17,6 +17,7 @@ use irresponsible::{
 mod chrome;
 mod help;
 mod layout;
+mod room;
 mod scrollbar;
 mod spectrum;
 mod text_field;
@@ -62,6 +63,7 @@ const WIDTH: f64 = 1100.0;
 const HEIGHT: f64 = 860.0;
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
+    Room(room::Action),
     Preferences,
     Compact,
     ThemePicker(ThemeSlot),
@@ -141,6 +143,7 @@ enum RouteSide {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScrollSurface {
+    RoomSettings,
     Sidebar,
     Picker,
 }
@@ -148,9 +151,11 @@ enum ScrollSurface {
 enum ValueBar {
     Volume,
     SpectrumIntensity,
+    Room(room::Bar),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
+    Room(room::Drag),
     ValueBar {
         target: ValueBar,
         bounds: Rect,
@@ -164,6 +169,7 @@ enum Drag {
 }
 #[derive(Clone, PartialEq, Eq)]
 enum ClickTarget {
+    Room(room::Text),
     Titlebar,
     Filter,
     Picker,
@@ -173,6 +179,7 @@ enum ClickTarget {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NumberField {
+    Room(room::Parameter),
     ComparisonTrim,
     SpectrumIntensity,
     Generation(GenerationParameter),
@@ -191,6 +198,11 @@ impl StepDirection {
     }
 }
 enum TextFocus {
+    Room {
+        target: room::Text,
+        field: TextField,
+        layout: Option<Box<chrome::FieldLayout>>,
+    },
     Search,
     Picker,
     PresetName {
@@ -220,6 +232,9 @@ enum Navigation {
 
 #[derive(Clone, Copy)]
 enum PickerKind {
+    RoomChoice(room::ChoiceField),
+    RoomMicrophone,
+    RoomMicrophoneChannel,
     CatalogFilter,
     GenerationLength,
     GenerationAlignment,
@@ -234,6 +249,9 @@ enum PickerKind {
 impl PickerKind {
     fn action(self) -> Option<Action> {
         Some(match self {
+            Self::RoomChoice(field) => Action::Room(field.action()),
+            Self::RoomMicrophone => Action::Room(room::Action::Microphone),
+            Self::RoomMicrophoneChannel => Action::Room(room::Action::MicrophoneChannel),
             Self::Themes(slot) => Action::ThemePicker(slot),
             Self::Presets => Action::PresetPicker,
             Self::Spectrum(setting) => Action::SpectrumPicker(setting),
@@ -374,6 +392,7 @@ impl View {
     }
 }
 enum JobResult {
+    RoomPrepared(ContentHash, View, Box<Engine>),
     Catalog(Catalog),
     Prepared(View, Box<Engine>),
     Nothing,
@@ -431,6 +450,7 @@ impl MenuBar {
                 }
             }
             Lifecycle::Starting => "starting",
+            Lifecycle::Measuring { .. } => "measuring",
             Lifecycle::Recovering { .. } => "recovering",
             Lifecycle::Failed(_) => "failed",
             Lifecycle::Stopped => "stopped",
@@ -533,8 +553,36 @@ pub fn run() -> Result<()> {
         .map_err(|e| invalid(e.to_string()))
 }
 
+pub fn room_smoke(
+    path: &std::path::Path,
+    layout: irresponsible::measurement::Layout,
+) -> Result<()> {
+    room::smoke(path, layout)
+}
+
+pub fn run_simulated() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let store = Store::at(directory.path())?;
+    let mut scenario = std::env::args()
+        .nth(2)
+        .map(|p| irresponsible::measurement::simulation::Scenario::load(std::path::Path::new(&p)))
+        .transpose()?
+        .unwrap_or_default();
+    scenario.pace = irresponsible::measurement::simulation::Pace::RealTime;
+    let event_loop = EventLoop::new().map_err(|e| invalid(e.to_string()))?;
+    let mut app = App::with_backend(store, audio::Backend::Simulated(scenario))?;
+    app.room.opened = true;
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| invalid(e.to_string()))
+}
+
 #[derive(Default)]
 pub enum PreviewState {
+    Room,
+    RoomSetup,
+    RoomVerification,
+    RoomFilter,
     #[default]
     Comparison,
     GraphMenu,
@@ -560,6 +608,10 @@ impl std::str::FromStr for PreviewState {
     type Err = irresponsible::error::Error;
     fn from_str(value: &str) -> Result<Self> {
         match value {
+            "room" => Ok(Self::Room),
+            "room-setup" => Ok(Self::RoomSetup),
+            "room-verify" => Ok(Self::RoomVerification),
+            "room-filter" => Ok(Self::RoomFilter),
             "comparison" => Ok(Self::Comparison),
             "graph-menu" => Ok(Self::GraphMenu),
             "filter-menu" => Ok(Self::FilterMenu),
@@ -593,6 +645,15 @@ pub fn render_preview(
     state: PreviewState,
 ) -> Result<()> {
     WindowSize::try_from(dimensions)?;
+    if matches!(
+        state,
+        PreviewState::Room
+            | PreviewState::RoomSetup
+            | PreviewState::RoomVerification
+            | PreviewState::RoomFilter
+    ) {
+        return room::render_preview(path, dimensions, scale, state);
+    }
     let compact_preview = matches!(state, PreviewState::Compact)
         || dimensions[0] < 880
         || f64::from(dimensions[1]) < layout::MIN_HEIGHT;
@@ -671,6 +732,12 @@ pub fn render_preview(
         app.action(Action::Compact);
     }
     match state {
+        PreviewState::Room
+        | PreviewState::RoomSetup
+        | PreviewState::RoomVerification
+        | PreviewState::RoomFilter => {
+            unreachable!("room preview handled separately")
+        }
         PreviewState::Spectrum | PreviewState::SpectrumSettings | PreviewState::SpectrumLight => {
             if matches!(state, PreviewState::SpectrumLight) {
                 app.system_appearance = Appearance::Light;
@@ -805,6 +872,8 @@ pub fn render_preview(
 }
 
 struct App {
+    room: room::Workspace,
+    audio_backend: audio::Backend,
     store: Store,
     settings: Settings,
     theme: Theme,
@@ -857,6 +926,9 @@ struct App {
 
 impl App {
     fn new(store: Store) -> Result<Self> {
+        Self::with_backend(store, audio::Backend::Hardware)
+    }
+    fn with_backend(store: Store, backend: audio::Backend) -> Result<Self> {
         let (mut settings, mut message, settings_healthy) = match store.load() {
             Ok(settings) => (
                 settings,
@@ -872,13 +944,22 @@ impl App {
                 false,
             ),
         };
-        let devices = match audio::devices() {
-            Ok(devices) => devices,
-            Err(e) => {
-                message = e.to_string();
-                Vec::new()
+        let devices = match &backend {
+            audio::Backend::Simulated(scenario) => {
+                irresponsible::measurement::simulation::devices(scenario)
             }
+            audio::Backend::Hardware => match audio::devices() {
+                Ok(devices) => devices,
+                Err(e) => {
+                    message = e.to_string();
+                    Vec::new()
+                }
+            },
         };
+        if matches!(backend, audio::Backend::Simulated(_)) {
+            settings.route = Some(irresponsible::measurement::simulation::route());
+            settings.room.microphone = Some(irresponsible::measurement::simulation::microphone());
+        }
         if settings.route.is_none() {
             settings.route = audio::default_route(&devices);
         }
@@ -904,11 +985,18 @@ impl App {
         if let Origin::AutoEq { generation, .. } = &active.correction.origin {
             settings.generation = *generation;
         }
-        let runtime = Runtime::new(active.correction.clone(), settings.controls, store.clone())?;
+        let runtime = Runtime::with_backend(
+            active.correction.clone(),
+            settings.controls,
+            store.clone(),
+            backend.clone(),
+        )?;
         let catalog = Source::new(store.clone())?.cached_catalog().ok();
         let system_appearance = Appearance::Dark;
         let theme = Theme::new(settings.appearance.selected(system_appearance));
         Ok(Self {
+            room: room::Workspace::default(),
+            audio_backend: backend,
             theme,
             system_appearance,
             store,
@@ -964,20 +1052,65 @@ impl App {
         self.dirty = true;
     }
     fn save(&mut self) {
+        let mut persisted = self.settings.clone();
+        if let Some(restore) = &self.room.return_to {
+            persisted.active = Some(restore.correction);
+            persisted.controls = restore.controls;
+        }
         if self.settings_healthy
-            && let Err(e) = self.store.save(&self.settings)
+            && let Err(e) = self.store.save(&persisted)
         {
             self.message = format!("Could not save settings: {e}");
         }
     }
-    fn command(&mut self, command: Command) {
-        let starting = matches!(command, Command::Start(_, _));
-        match self.runtime.send(command) {
-            Ok(()) if starting => self.lifecycle = Lifecycle::Starting,
-            Ok(()) => {}
-            Err(error) => self.message = error.to_string(),
+    fn submit_command(&mut self, command: Command) -> Result<()> {
+        let starting = matches!(command, Command::Start(..));
+        let receipt = self.runtime.send(command)?;
+        if starting {
+            self.lifecycle = Lifecycle::Starting;
+            self.room.muted = false;
+            self.room.expected = None;
+        }
+        if let audio::Receipt::Measurement(id) = receipt {
+            self.room.expected = Some(id);
         }
         self.dirty = true;
+        Ok(())
+    }
+    fn command(&mut self, command: Command) {
+        if let Err(error) = self.submit_command(command) {
+            self.message = error.to_string();
+            self.dirty = true;
+        }
+    }
+    fn stop_owned_measurement(&mut self) {
+        if self.room.running || matches!(self.lifecycle, Lifecycle::Measuring { .. }) {
+            if let Err(error) = self.room_action(room::Action::Stop) {
+                self.message = error.to_string();
+            }
+            self.room.muted = true;
+            self.dirty = true;
+        }
+    }
+    fn hide_window(&mut self) {
+        self.stop_owned_measurement();
+        if let Some(window) = &self.window {
+            window.set_visible(false);
+        }
+        self.frames
+            .occlusion_changed(Occlusion::Occluded, Instant::now());
+    }
+    fn room_escape(&mut self) -> bool {
+        if self.room.running {
+            self.stop_owned_measurement();
+            return true;
+        }
+        if self.room.opened && self.room.dialog.is_some() && self.picker.is_none() {
+            self.text_focus = None;
+            self.action(Action::Room(room::Action::Dialog(None)));
+            return true;
+        }
+        false
     }
     fn controls_changed(&mut self) {
         self.active.analysis.configure(self.settings.controls);
@@ -997,7 +1130,7 @@ impl App {
         self.controls_changed();
     }
     fn current_rate(&self) -> Rate {
-        if let Lifecycle::Running { rate, .. } = self.lifecycle {
+        if let Lifecycle::Running { rate, .. } | Lifecycle::Measuring { rate } = self.lifecycle {
             return rate;
         }
         self.settings
@@ -1009,6 +1142,12 @@ impl App {
     }
     fn job(&mut self, task: impl FnOnce(Arc<AtomicBool>) -> Result<JobResult> + Send + 'static) {
         self.submit(Box::new(task));
+    }
+    fn cancel_preparation(&mut self) {
+        if let Some(job) = &mut self.job {
+            job.cancel.store(true, Ordering::Relaxed);
+            job.next = None;
+        }
     }
     fn submit(&mut self, task: Task) {
         self.message =
@@ -1046,9 +1185,13 @@ impl App {
         if let Some(route) = self.settings.route.clone() {
             self.command(Command::Start(route, SystemOutput::RouteThroughCapture));
         }
-        if self.catalog.as_ref().is_none_or(|catalog| {
-            catalog.entries.is_empty() || !catalog.inventory_known() || !catalog.metadata_known()
-        }) {
+        if matches!(self.audio_backend, audio::Backend::Hardware)
+            && self.catalog.as_ref().is_none_or(|catalog| {
+                catalog.entries.is_empty()
+                    || !catalog.inventory_known()
+                    || !catalog.metadata_known()
+            })
+        {
             self.action(Action::RefreshCatalog);
         }
     }
@@ -1115,7 +1258,7 @@ impl App {
     fn catalog_target(&self) -> CatalogTarget {
         self.settings
             .catalog_target
-            .unwrap_or(match self.active.correction.target {
+            .unwrap_or(match self.active.correction.target() {
                 Target::Harman | Target::Reference => CatalogTarget::Reference,
                 Target::Flat => CatalogTarget::Flat,
                 Target::AutoEq | Target::Custom => CatalogTarget::AutoEq,
@@ -1184,7 +1327,7 @@ impl App {
                 let catalog = self.catalog.as_ref().expect("selected catalog");
                 let entry = &catalog.entries[*index];
                 let target = self.catalog_target().resolve(entry, self.current_rate());
-                if target != Some(self.active.correction.target) {
+                if target != Some(self.active.correction.target()) {
                     return false;
                 }
                 match &self.active.correction.origin {
@@ -1201,9 +1344,9 @@ impl App {
                         *path == entry.path
                             && *revision == catalog.revision
                             && *generation == self.settings.generation
-                            && (self.active.correction.target == Target::Flat
+                            && (self.active.correction.target() == Target::Flat
                                 || catalog
-                                    .target(entry, self.active.correction.target)
+                                    .target(entry, self.active.correction.target())
                                     .is_ok_and(|definition| definition.description() == *target))
                     }
                     _ => false,
@@ -1278,7 +1421,33 @@ impl App {
         }
     }
     fn action(&mut self, action: Action) {
+        if action == Action::Room(room::Action::Stop)
+            || (action == Action::StartStop
+                && matches!(self.lifecycle, Lifecycle::Measuring { .. }))
+        {
+            self.stop_owned_measurement();
+            return;
+        }
+        if self.room.opened
+            && self.room.dialog.is_some()
+            && matches!(
+                action,
+                Action::Preferences | Action::SavePreset | Action::Search
+            )
+        {
+            return;
+        }
+        if self.room.opened && action == Action::Search {
+            return;
+        }
         self.dirty |= self.help.clear();
+        if action == Action::Room(room::Action::CommitName) {
+            if let Err(error) = self.commit_room_text() {
+                self.message = error.to_string();
+            }
+            self.dirty = true;
+            return;
+        }
         if !matches!(action, Action::EditNumber(target) if matches!(self.text_focus, Some(TextFocus::Number { target: current, .. }) if current == target))
             && matches!(self.text_focus, Some(TextFocus::Number { .. }))
             && !self.commit_number()
@@ -1291,6 +1460,21 @@ impl App {
             }
             self.dirty = true;
             return;
+        }
+        if self.room.opened && action == Action::SavePreset {
+            if let Err(error) = self.save_room_preset() {
+                self.message = error.to_string();
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.room.opened && action == Action::Preferences {
+            if let Err(error) = self.room_action(room::Action::Close) {
+                self.message = error.to_string();
+                self.dirty = true;
+                return;
+            }
+            self.browser = Browser::Catalog;
         }
         if self.picker.is_some()
             && !matches!(action, Action::PickerSearch | Action::ClearPickerSearch)
@@ -1318,6 +1502,11 @@ impl App {
             self.scroll = 0.0;
         }
         match action {
+            Action::Room(action) => {
+                if let Err(e) = self.room_action(action) {
+                    self.message = e.to_string();
+                }
+            }
             Action::Scroll(..) => unreachable!("scrollbar dragging begins on mouse press"),
             Action::Preferences => {
                 self.dismiss_picker();
@@ -1529,9 +1718,10 @@ impl App {
                 }
             }
             Action::StartStop => match self.lifecycle {
-                Lifecycle::Running { .. } | Lifecycle::Starting | Lifecycle::Recovering { .. } => {
-                    self.command(Command::Stop)
-                }
+                Lifecycle::Running { .. }
+                | Lifecycle::Measuring { .. }
+                | Lifecycle::Starting
+                | Lifecycle::Recovering { .. } => self.command(Command::Stop),
                 _ => {
                     if let Some(route) = self.settings.route.clone() {
                         self.command(Command::Start(route, SystemOutput::RouteThroughCapture));
@@ -1551,7 +1741,7 @@ impl App {
             Action::ChoosePair(side, pair) => {
                 self.choose_pair(side, pair);
             }
-            Action::RefreshDevices => match audio::devices() {
+            Action::RefreshDevices => match self.audio_backend.devices() {
                 Ok(devices) => {
                     self.devices = devices;
                     if self.settings.route.is_none() {
@@ -1642,9 +1832,8 @@ impl App {
                 if let Some(selected) = &mut self.selected {
                     selected.intent = SelectionIntent::Compare;
                 }
-                if let Some(job) = &mut self.job {
-                    job.cancel.store(true, Ordering::Relaxed);
-                    job.next = None;
+                if self.job.is_some() {
+                    self.cancel_preparation();
                     self.message =
                         "Cancelling the preparation; the current filter remains active.".into();
                 } else if self.preview.is_some() {
@@ -1670,6 +1859,7 @@ impl App {
             }
             Action::NudgeNumber(target, direction) => {
                 let step = match target {
+                    NumberField::Room(p) => p.step(),
                     NumberField::ComparisonTrim => 0.5,
                     NumberField::SpectrumIntensity => 1.0,
                     NumberField::Generation(parameter) => parameter.step(),
@@ -1688,6 +1878,9 @@ impl App {
                     .find(|(_, hit)| *hit == action)
                     .expect("a value bar action comes from its visible control")
                     .0;
+                if matches!(target, ValueBar::Room(_)) {
+                    self.begin_room_bar();
+                }
                 self.dragging = Some(Drag::ValueBar { target, bounds });
                 self.value_bar_from_cursor(target, bounds);
             }
@@ -1706,7 +1899,9 @@ impl App {
             Some(TextFocus::Picker) => {
                 Some(&self.picker.as_ref().expect("picker text focus").filter)
             }
-            Some(TextFocus::PresetName { field, .. }) => Some(field),
+            Some(TextFocus::PresetName { field, .. } | TextFocus::Room { field, .. }) => {
+                Some(field)
+            }
             Some(TextFocus::Number { field, .. }) => Some(field),
             None => None,
         }
@@ -1717,7 +1912,9 @@ impl App {
             Some(TextFocus::Picker) => {
                 Some(&mut self.picker.as_mut().expect("picker text focus").filter)
             }
-            Some(TextFocus::PresetName { field, .. }) => Some(field),
+            Some(TextFocus::PresetName { field, .. } | TextFocus::Room { field, .. }) => {
+                Some(field)
+            }
             Some(TextFocus::Number { field, .. }) => Some(field),
             None => None,
         }
@@ -1731,13 +1928,16 @@ impl App {
                 .expect("picker text focus")
                 .layout
                 .as_deref(),
-            Some(TextFocus::PresetName { layout, .. }) => layout.as_deref(),
+            Some(TextFocus::PresetName { layout, .. } | TextFocus::Room { layout, .. }) => {
+                layout.as_deref()
+            }
             Some(TextFocus::Number { layout, .. }) => layout.as_deref(),
             None => None,
         }
     }
     fn number_value(&self, target: NumberField) -> f32 {
         match target {
+            NumberField::Room(p) => self.room_value(p) as f32,
             NumberField::ComparisonTrim => self.settings.controls.trim.db(),
             NumberField::SpectrumIntensity => self.settings.spectrum.intensity.percent(),
             NumberField::Generation(parameter) => self.settings.generation.value(parameter),
@@ -1748,6 +1948,7 @@ impl App {
             return Err(invalid("Enter a finite number, or press Escape to cancel"));
         }
         match target {
+            NumberField::Room(p) => self.room_number(p, f64::from(value))?,
             NumberField::ComparisonTrim => {
                 self.settings.controls.trim = ComparisonTrim::try_from(value.clamp(-12.0, 12.0))?;
                 self.controls_changed();
@@ -1875,6 +2076,18 @@ impl App {
         }
     }
     fn text_key(&mut self, key: &Key, text: Option<&str>) -> bool {
+        if matches!(self.text_focus, Some(TextFocus::Room { .. })) {
+            if *key == Key::Named(NamedKey::Enter) || *key == Key::Named(NamedKey::Tab) {
+                if let Err(e) = self.commit_room_text() {
+                    self.message = e.to_string();
+                }
+                return true;
+            }
+            if *key == Key::Named(NamedKey::Escape) {
+                self.text_focus = None;
+                return true;
+            }
+        }
         if self.picker.is_some() {
             match key {
                 Key::Named(NamedKey::Escape) => {
@@ -2080,7 +2293,7 @@ impl App {
         let endpoint = |device: &audio::DeviceInfo| Endpoint {
             uid: device.uid.clone(),
             label: device.name.clone(),
-            pair: StereoPair::default(),
+            channels: StereoPair::default(),
         };
         if let Some(route) = &mut self.settings.route {
             let selected = match side {
@@ -2121,8 +2334,8 @@ impl App {
             .as_mut()
             .expect("channel picker has a route");
         match side {
-            RouteSide::Capture => route.capture.pair = pair,
-            RouteSide::Playback => route.playback.pair = pair,
+            RouteSide::Capture => route.capture.channels = pair,
+            RouteSide::Playback => route.playback.channels = pair,
         }
         self.save();
     }
@@ -2134,7 +2347,7 @@ impl App {
             .map(|(view, _)| view)
             .or(self.awaiting.as_ref());
         let metadata = candidate
-            .filter(|view| view.correction.measured.is_some())
+            .filter(|view| view.correction.measured().is_some())
             .unwrap_or(&self.active);
         [
             Some(GraphToggle {
@@ -2149,23 +2362,19 @@ impl App {
                 selected: self.show_candidate,
                 color: colors.basic[2],
             }),
-            metadata.correction.measured.as_ref().map(|_| GraphToggle {
+            metadata.correction.measured().map(|_| GraphToggle {
                 label: "Measured",
                 action: Action::ShowMeasured,
                 selected: self.show_measured,
                 color: colors.secondary,
             }),
-            metadata
-                .correction
-                .target_curve
-                .as_ref()
-                .map(|_| GraphToggle {
-                    label: "Target",
-                    action: Action::ShowTarget,
-                    selected: self.show_target,
-                    color: colors.basic[4],
-                }),
-            metadata.correction.measured.as_ref().map(|_| GraphToggle {
+            metadata.correction.target_curve().map(|_| GraphToggle {
+                label: "Target",
+                action: Action::ShowTarget,
+                selected: self.show_target,
+                color: colors.basic[4],
+            }),
+            metadata.correction.measured().map(|_| GraphToggle {
                 label: "Predicted",
                 action: Action::ShowPrediction,
                 selected: self.show_prediction,
@@ -2297,6 +2506,51 @@ impl App {
             })
         };
         let options: Vec<(String, Action, bool)> = match picker {
+            PickerKind::RoomChoice(field) => self.room_choices(field),
+            PickerKind::RoomMicrophone => self
+                .devices
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| {
+                    d.input_channels > 0
+                        && (!d.virtual_device
+                            || matches!(self.audio_backend, audio::Backend::Simulated(_)))
+                })
+                .map(|(index, d)| {
+                    (
+                        d.name.clone(),
+                        Action::Room(room::Action::ChooseMicrophone(index)),
+                        self.settings
+                            .room
+                            .microphone
+                            .as_ref()
+                            .is_some_and(|m| m.uid == d.uid),
+                    )
+                })
+                .collect(),
+            PickerKind::RoomMicrophoneChannel => {
+                let mic = self
+                    .settings
+                    .room
+                    .microphone
+                    .as_ref()
+                    .expect("channel menu has a microphone");
+                self.devices
+                    .iter()
+                    .find(|d| d.uid == mic.uid)
+                    .into_iter()
+                    .flat_map(|d| 0..d.input_channels)
+                    .map(|channel| {
+                        (
+                            format!("Channel {}", channel + 1),
+                            Action::Room(room::Action::ChooseMicrophoneChannel(MonoChannel(
+                                channel,
+                            ))),
+                            mic.channels == MonoChannel(channel),
+                        )
+                    })
+                    .collect()
+            }
             PickerKind::Themes(slot) => appearance::registry()
                 .iter()
                 .enumerate()
@@ -2405,7 +2659,7 @@ impl App {
                                 (
                                     format!("{} / {}", first + 1, first + 2),
                                     Action::ChoosePair(side, pair),
-                                    selected.pair == pair,
+                                    selected.channels == pair,
                                 )
                             })
                     })
@@ -2596,6 +2850,7 @@ impl App {
     fn scroll_from_cursor(&mut self, surface: ScrollSurface, bar: Scrollbar, grab: f64) {
         let offset = bar.offset(self.cursor.y, grab);
         match surface {
+            ScrollSurface::RoomSettings => self.room.settings_scroll = offset,
             ScrollSurface::Sidebar => self.scroll = offset,
             ScrollSurface::Picker => {
                 self.picker
@@ -2606,8 +2861,19 @@ impl App {
         }
         self.dirty = true;
     }
+    fn finish_drag(&mut self) {
+        match self.dragging {
+            Some(Drag::ValueBar {
+                target: ValueBar::Room(_),
+                ..
+            }) => self.finish_room_bar(),
+            Some(Drag::Room(drag)) => self.room_drag(drag, true),
+            _ => {}
+        }
+    }
     fn reset_value_bar(&mut self, target: ValueBar) {
         match target {
+            ValueBar::Room(parameter) => self.reset_room_bar(parameter),
             ValueBar::Volume => self.volume(Controls::default().volume.db()),
             ValueBar::SpectrumIntensity => self
                 .set_number(
@@ -2620,6 +2886,9 @@ impl App {
     fn value_bar_from_cursor(&mut self, target: ValueBar, bounds: Rect) {
         let fraction = ((self.cursor.x - bounds.x0) / bounds.width()).clamp(0.0, 1.0) as f32;
         match target {
+            ValueBar::Room(parameter) => {
+                self.room_bar_from_fraction(parameter, f64::from(fraction))
+            }
             ValueBar::Volume => self.volume(fraction * 80.0 - 80.0),
             ValueBar::SpectrumIntensity => self
                 .set_number(NumberField::SpectrumIntensity, fraction * 100.0)
@@ -2658,69 +2927,85 @@ impl App {
     }
     fn refresh_visuals(&mut self) {
         self.sync_visuals();
-        if self.visible() && matches!(self.lifecycle, Lifecycle::Running { .. }) {
+        if self.visible()
+            && matches!(
+                self.lifecycle,
+                Lifecycle::Running { .. } | Lifecycle::Measuring { .. }
+            )
+        {
             self.peaks = self.runtime.meters.peaks();
-            self.spectrum.update();
+            if matches!(self.lifecycle, Lifecycle::Running { .. }) {
+                self.spectrum.update();
+            }
         }
+    }
+    fn handle_audio_event(&mut self, event: Event) {
+        match event {
+            Event::Measurement(id, progress) if self.room.expected == Some(id) => {
+                self.room_progress(progress)
+            }
+            Event::MeasurementMuted(id) if self.room.expected == Some(id) => self.room.muted = true,
+            Event::Levels(id, report) if self.room.expected == Some(id) => self.room_levels(report),
+            Event::Measurement(..) | Event::MeasurementMuted(_) | Event::Levels(..) => {}
+            Event::Spectrum(stream) => self.spectrum.attach(stream),
+            Event::State(state) => {
+                if !matches!(state, Lifecycle::Running { .. }) {
+                    self.spectrum.detach();
+                }
+                self.lifecycle = state;
+                if !self.route_editable()
+                    && matches!(
+                        self.picker.as_ref().map(|picker| picker.kind),
+                        Some(PickerKind::Device(_) | PickerKind::Pair(_))
+                    )
+                {
+                    self.dismiss_picker();
+                }
+                if let Lifecycle::Failed(reason) = &self.lifecycle {
+                    self.message = reason.clone();
+                }
+            }
+            Event::Message(message) => {
+                self.message = message;
+            }
+            Event::ActivationRejected(correction, message) => {
+                if self
+                    .awaiting
+                    .as_ref()
+                    .is_some_and(|view| Arc::ptr_eq(&view.correction, &correction))
+                {
+                    self.awaiting = None;
+                    self.message = message;
+                }
+            }
+            Event::Activated(correction) => {
+                if let Some(view) = self.awaiting.take() {
+                    if Arc::ptr_eq(&view.correction, &correction) {
+                        self.active = view;
+                        self.message = format!(
+                            "Loaded {}. The selected profile has replaced the previous IR.",
+                            self.active.correction.name
+                        );
+                    } else {
+                        self.awaiting = Some(view);
+                        self.active_from_receipt(correction);
+                    }
+                } else {
+                    self.active_from_receipt(correction);
+                }
+                self.settings.active = Some(self.active.hash);
+                self.save();
+            }
+        }
+        if let Some(menu) = &self.menu {
+            menu.status(&self.lifecycle, self.settings.controls);
+        }
+        self.dirty = true;
     }
     fn poll(&mut self) {
         self.dirty |= self.theme.advance(Instant::now());
         while let Ok(event) = self.runtime.events.try_recv() {
-            match event {
-                Event::Spectrum(stream) => self.spectrum.attach(stream),
-                Event::State(state) => {
-                    if !matches!(state, Lifecycle::Running { .. }) {
-                        self.spectrum.detach();
-                    }
-                    if matches!(
-                        state,
-                        Lifecycle::Stopped | Lifecycle::Recovering { .. } | Lifecycle::Failed(_)
-                    ) {
-                        self.awaiting = None;
-                    }
-                    self.lifecycle = state;
-                    if !self.route_editable()
-                        && matches!(
-                            self.picker.as_ref().map(|picker| picker.kind),
-                            Some(PickerKind::Device(_) | PickerKind::Pair(_))
-                        )
-                    {
-                        self.dismiss_picker();
-                    }
-                    if let Lifecycle::Failed(reason) = &self.lifecycle {
-                        self.message = reason.clone();
-                    }
-                }
-                Event::Message(message) => {
-                    self.message = message;
-                }
-                Event::ActivationRejected(message) => {
-                    self.awaiting = None;
-                    self.message = message;
-                }
-                Event::Activated(correction) => {
-                    if let Some(view) = self.awaiting.take() {
-                        if Arc::ptr_eq(&view.correction, &correction) {
-                            self.active = view;
-                            self.message = format!(
-                                "Loaded {}. The selected profile has replaced the previous IR.",
-                                self.active.correction.name
-                            );
-                        } else {
-                            self.awaiting = Some(view);
-                            self.active_from_receipt(correction);
-                        }
-                    } else {
-                        self.active_from_receipt(correction);
-                    }
-                    self.settings.active = Some(self.active.hash);
-                    self.save();
-                }
-            }
-            if let Some(menu) = &self.menu {
-                menu.status(&self.lifecycle, self.settings.controls);
-            }
-            self.dirty = true;
+            self.handle_audio_event(event);
         }
         if let Some(job) = &self.job {
             let result = match job.receiver.try_recv() {
@@ -2744,6 +3029,15 @@ impl App {
                     result
                 };
                 match result {
+                    Ok(JobResult::RoomPrepared(session, view, engine)) => {
+                        match self.accept_room_preparation(session) {
+                            Ok(()) => {
+                                self.preview = Some((view, engine));
+                                self.message = "Prepared a new room filter. New coefficients require measured verification.".into();
+                            }
+                            Err(error) => self.message = error.to_string(),
+                        }
+                    }
                     Ok(JobResult::Catalog(catalog)) => {
                         self.catalog = Some(catalog);
                         self.selected = None;
@@ -2882,6 +3176,9 @@ impl App {
             .map_or(1.0, |window| window.scale_factor())
     }
     fn build_scene(&mut self, size: Size, scale: f64) -> Scene {
+        if self.room.opened {
+            return self.room_scene(size, scale);
+        }
         let chrome = self
             .window_chrome
             .expect("window chrome is measured before drawing");
@@ -2909,7 +3206,7 @@ impl App {
             .or(self.awaiting.as_ref());
         let view = candidate.unwrap_or(&self.active);
         let metadata = candidate
-            .filter(|view| view.correction.measured.is_some())
+            .filter(|view| view.correction.measured().is_some())
             .unwrap_or(&self.active);
         let help_enabled = self.help_enabled();
         let mut p = Painter::new(
@@ -2924,7 +3221,10 @@ impl App {
         let editable = matches!(self.lifecycle, Lifecycle::Stopped | Lifecycle::Failed(_));
         let running = matches!(
             self.lifecycle,
-            Lifecycle::Running { .. } | Lifecycle::Starting | Lifecycle::Recovering { .. }
+            Lifecycle::Running { .. }
+                | Lifecycle::Measuring { .. }
+                | Lifecycle::Starting
+                | Lifecycle::Recovering { .. }
         );
         let transport_label = if running { "Stop" } else { "Start" };
         let transport_enabled = running || self.settings.route.is_some();
@@ -2936,6 +3236,7 @@ impl App {
             }
             .into(),
             Lifecycle::Starting => "Starting...".into(),
+            Lifecycle::Measuring { rate } => format!("Measuring / {} Hz", rate.hz()),
             Lifecycle::Running {
                 rate,
                 estimated_latency_ms,
@@ -3073,8 +3374,15 @@ impl App {
                 colors.pane(),
             );
             if !self.browser.is_preferences() {
+                p.button(
+                    150.0,
+                    top + 12.0,
+                    "Room",
+                    Action::Room(room::Action::Open),
+                    true,
+                );
                 p.section(
-                    Rect::new(0.0, top + 12.0, SIDEBAR - 38.0, top + 36.0),
+                    Rect::new(0.0, top + 12.0, 145.0, top + 36.0),
                     Icon::Headphones,
                     "Headphones",
                     colors.secondary,
@@ -3235,7 +3543,7 @@ impl App {
                 let pair_label = endpoint.map_or_else(
                     || "1 / 2".into(),
                     |endpoint| {
-                        let [left, right] = endpoint.pair.indices();
+                        let [left, right] = endpoint.channels.indices();
                         format!("{} / {}", left + 1, right + 1)
                     },
                 );
@@ -3307,7 +3615,7 @@ impl App {
             ] {
                 let available = selected_entry
                     .is_some_and(|entry| entry.supports(target, self.active.correction.rate));
-                if available || (selected_entry.is_none() && view.correction.target == target) {
+                if available || (selected_entry.is_none() && view.correction.target() == target) {
                     x =
                         p.chip(
                             x,
@@ -3317,7 +3625,7 @@ impl App {
                             if browsing_catalog {
                                 catalog_target.includes(target)
                             } else {
-                                view.correction.target == target
+                                view.correction.target() == target
                             },
                             available && self.job.is_none(),
                         )
@@ -3345,6 +3653,7 @@ impl App {
                         impulse.original_rate,
                         impulse.conversion.delay()
                     ),
+                    Origin::Room { .. } => "Room correction / stereo acoustic measurement".into(),
                     Origin::Identity => {
                         "Choose a profile on the left to compare its response with the loaded IR."
                             .into()
@@ -3352,9 +3661,9 @@ impl App {
                 };
                 let mut source_row = g.row(top + Layout::SOURCE_TOP);
                 if selected_entry.is_some_and(|entry| {
-                    entry.supports(view.correction.target, self.active.correction.rate)
+                    entry.supports(view.correction.target(), self.active.correction.rate)
                 }) && matches!(
-                    view.correction.target,
+                    view.correction.target(),
                     Target::Harman | Target::Reference | Target::Flat
                 ) {
                     p.toggle(
@@ -3438,7 +3747,7 @@ impl App {
                 scale,
             );
             if self.show_measured
-                && let Some(curve) = &metadata.correction.measured
+                && let Some(curve) = metadata.correction.measured()
             {
                 p.curve(
                     &sample_curve(curve, &self.active.response[0]),
@@ -3448,7 +3757,7 @@ impl App {
                 );
             }
             if self.show_target
-                && let Some(curve) = &metadata.correction.target_curve
+                && let Some(curve) = metadata.correction.target_curve()
             {
                 p.curve(
                     &sample_curve(curve, &self.active.response[0]),
@@ -3458,7 +3767,7 @@ impl App {
                 );
             }
             if self.show_prediction
-                && let Some(measured) = &metadata.correction.measured
+                && let Some(measured) = metadata.correction.measured()
             {
                 let mut prediction = metadata.response[0].clone();
                 for (&f, db) in prediction.frequency.iter().zip(&mut prediction.db) {
@@ -3601,8 +3910,9 @@ impl App {
                         .decode_utf8_lossy(),
                         Origin::Imported { .. } => "Custom WAV".into(),
                         Origin::Identity => "Identity".into(),
+                        Origin::Room { .. } => "Room measurement".into(),
                     };
-                    format!("{provider} / {:?}", view.correction.target)
+                    format!("{provider} / {:?}", view.correction.target())
                 } else {
                     "Loading the selected profile; loaded IR is unchanged".into()
                 };
@@ -3758,7 +4068,7 @@ impl App {
                             "limited"
                         }
                     ),
-                    _ => format!("{:?}", correction.target),
+                    _ => format!("{:?}", correction.target()),
                 };
                 let lines = [
                     format!(
@@ -4441,13 +4751,7 @@ impl ApplicationHandler for App {
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                if let Some(window) = &self.window {
-                    window.set_visible(false);
-                    self.frames
-                        .occlusion_changed(Occlusion::Occluded, Instant::now());
-                }
-            }
+            WindowEvent::CloseRequested => self.hide_window(),
             WindowEvent::ThemeChanged(theme) => self.system_appearance_changed(match theme {
                 winit::window::Theme::Light => Appearance::Light,
                 winit::window::Theme::Dark => Appearance::Dark,
@@ -4542,6 +4846,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 match self.dragging {
+                    Some(Drag::Room(drag)) => self.room_drag(drag, false),
                     Some(Drag::ValueBar { target, bounds }) => {
                         self.value_bar_from_cursor(target, bounds)
                     }
@@ -4569,11 +4874,14 @@ impl ApplicationHandler for App {
                         .map(|(_, action)| *action);
                     window.set_cursor(match hit {
                         Some(Action::ValueBar(_)) => winit::window::CursorIcon::EwResize,
+                        Some(Action::Room(room::Action::Graph)) => self.room_graph_cursor(),
+
                         Some(
                             Action::Search
                             | Action::EditNumber(_)
                             | Action::PickerSearch
-                            | Action::PresetName,
+                            | Action::PresetName
+                            | Action::Room(room::Action::EditText(_)),
                         ) => winit::window::CursorIcon::Text,
                         _ => winit::window::CursorIcon::Default,
                     });
@@ -4584,7 +4892,8 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
                 ..
-            } if self.graph_geometry().graph.contains(self.cursor)
+            } if !self.room.opened
+                && self.graph_geometry().graph.contains(self.cursor)
                 && !(self.browser.is_preferences() && self.cursor.x < SIDEBAR) =>
             {
                 if self.commit_number() {
@@ -4607,6 +4916,8 @@ impl ApplicationHandler for App {
                 if state == ElementState::Pressed {
                     self.pressed = hit;
                     match hit {
+                        Some(Action::Room(room::Action::Graph)) => self.begin_room_drag(),
+
                         Some(Action::Scroll(surface, bar)) => self.begin_scroll(surface, bar),
                         Some(Action::ValueBar(target)) => {
                             if self.modifiers.alt_key() {
@@ -4620,7 +4931,8 @@ impl ApplicationHandler for App {
                             Action::Search
                             | Action::EditNumber(_)
                             | Action::PickerSearch
-                            | Action::PresetName,
+                            | Action::PresetName
+                            | Action::Room(room::Action::EditText(_)),
                         ) => {
                             let action = hit.expect("text field action");
                             let already_number = matches!((action, &self.text_focus), (Action::EditNumber(target), Some(TextFocus::Number {target: current, ..})) if target == *current);
@@ -4628,7 +4940,7 @@ impl ApplicationHandler for App {
                                 (action, &self.text_focus),
                                 (Action::PickerSearch, Some(TextFocus::Picker))
                                     | (Action::PresetName, Some(TextFocus::PresetName { .. }))
-                            );
+                            ) || matches!((action,&self.text_focus),(Action::Room(room::Action::EditText(target)),Some(TextFocus::Room {target:current,..})) if target==*current);
                             if (action == Action::Search || !already_number) && !already_entry {
                                 self.action(action);
                             }
@@ -4643,6 +4955,9 @@ impl ApplicationHandler for App {
                                 Action::Search => ClickTarget::Filter,
                                 Action::PickerSearch => ClickTarget::Picker,
                                 Action::PresetName => ClickTarget::PresetName,
+                                Action::Room(room::Action::EditText(target)) => {
+                                    ClickTarget::Room(target)
+                                }
                                 Action::EditNumber(target) => ClickTarget::Number(target),
                                 _ => unreachable!("text field action"),
                             };
@@ -4696,6 +5011,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 } else {
+                    self.finish_drag();
                     if self.dragging.is_none()
                         && let Some(action) = self.pressed.take()
                         && hit == Some(action)
@@ -4708,6 +5024,15 @@ impl ApplicationHandler for App {
                 self.dirty = true;
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.room.opened && self.picker.is_none() {
+                    let amount = match delta {
+                        MouseScrollDelta::LineDelta(_, rows) => f64::from(rows) * ROW,
+                        MouseScrollDelta::PixelDelta(p) => p.y / self.scale(),
+                    };
+                    self.room_scroll(amount);
+                    self.dirty = true;
+                    return;
+                }
                 self.dirty |= self.help.clear();
                 self.last_click = None;
                 let pixels = match delta {
@@ -4756,6 +5081,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(true) if self.browser == Browser::General => self.refresh_login(),
             WindowEvent::Focused(false) => {
+                self.finish_drag();
                 self.pressed = None;
                 self.dragging = None;
                 self.commit_number();
@@ -4781,6 +5107,9 @@ impl ApplicationHandler for App {
                 });
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if event.logical_key == Key::Named(NamedKey::Escape) && self.room_escape() {
+                    return;
+                }
                 self.last_click = None;
                 let command = self.modifiers.super_key() || self.modifiers.control_key();
                 match &event.logical_key {
@@ -4789,11 +5118,7 @@ impl ApplicationHandler for App {
                         return;
                     }
                     Key::Character(c) if command && c.eq_ignore_ascii_case("w") => {
-                        if let Some(window) = &self.window {
-                            window.set_visible(false);
-                            self.frames
-                                .occlusion_changed(Occlusion::Occluded, Instant::now());
-                        }
+                        self.hide_window();
                         return;
                     }
                     Key::Character(c) if command && c.as_str() == "," => {
@@ -4886,7 +5211,11 @@ impl ApplicationHandler for App {
                 } else if event.id == *menu.quieter.id() {
                     self.volume(self.settings.controls.volume.db() - 2.0);
                 } else if event.id == *menu.stop.id() {
-                    self.command(Command::Stop);
+                    if self.room.running {
+                        self.stop_owned_measurement();
+                    } else {
+                        self.command(Command::Stop);
+                    }
                 }
             }
         }
@@ -4894,7 +5223,10 @@ impl ApplicationHandler for App {
         if self.frames.is_due(now) {
             if self.frames.kind(now) == FrameKind::Visible
                 && (self.dirty
-                    || matches!(self.lifecycle, Lifecycle::Running { .. })
+                    || matches!(
+                        self.lifecycle,
+                        Lifecycle::Running { .. } | Lifecycle::Measuring { .. }
+                    )
                     || self.theme.is_transitioning())
             {
                 self.frames
@@ -4924,6 +5256,198 @@ impl ApplicationHandler for App {
 mod regression_tests {
     use super::*;
     use irresponsible::frame_schedule::FrameRate;
+    fn emulated_app() -> (tempfile::TempDir, App) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path()).unwrap();
+        let app = App::with_backend(store, audio::Backend::Simulated(Default::default())).unwrap();
+        (directory, app)
+    }
+    #[test]
+    fn hiding_the_window_cancels_measurement_and_clears_pending_movement() {
+        let (_directory, mut app) = emulated_app();
+        app.room.opened = true;
+        app.window_chrome = Some(WindowChrome {
+            height: 32.0,
+            controls_end: 81.0,
+        });
+        app.room.running = true;
+        app.room_progress(irresponsible::measurement::workflow::Progress::Move {
+            movement: irresponsible::measurement::workflow::Movement::Acquisition(0),
+            seconds: Some(1.0),
+            paused: false,
+        });
+        app.room.active_band = Some(Default::default());
+        app.hide_window();
+        assert!(!app.room.running);
+        assert!(app.room.muted);
+        assert!(app.room.active_band.is_none());
+        app.build_scene(Size::new(1440.0, 960.0), 1.0);
+        assert!(
+            !app.hits
+                .iter()
+                .any(|(_, action)| matches!(action, Action::Room(room::Action::Movement { .. })))
+        );
+        app.hide_window();
+        assert!(app.room.muted);
+    }
+    #[test]
+    fn escape_stops_measurement_before_dismissing_its_dialog() {
+        let (_directory, mut app) = emulated_app();
+        app.room.opened = true;
+        app.room.running = true;
+        app.room.dialog = Some(room::Dialog::Verification);
+        assert!(app.room_escape());
+        assert!(!app.room.running);
+        assert!(app.room.muted);
+        assert_eq!(app.room.dialog, Some(room::Dialog::Verification));
+        assert!(app.room_escape());
+        assert!(app.room.dialog.is_none());
+    }
+    #[test]
+    fn stop_ignores_invalid_numeric_text_and_cancels_measurement() {
+        let (_directory, mut app) = emulated_app();
+        app.room.opened = true;
+        app.room.running = true;
+        app.text_focus = Some(TextFocus::Number {
+            target: NumberField::Room(room::Parameter::ProbeLevel),
+            field: TextField::new("invalid input".into()),
+            layout: None,
+        });
+        for stop in [Action::Room(room::Action::Stop), Action::StartStop] {
+            app.room.running = true;
+            app.lifecycle = Lifecycle::Measuring {
+                rate: Rate::Hz48000,
+            };
+            app.action(stop);
+            assert!(!app.room.running);
+            assert!(app.room.muted);
+            assert!(
+                matches!(&app.text_focus, Some(TextFocus::Number { field, .. })
+                if field.text() == "invalid input")
+            );
+            assert!(!app.message.contains("Enter a number"));
+        }
+    }
+    #[test]
+    fn late_stop_and_unrelated_rejection_preserve_the_requested_filter_identity() {
+        let (_directory, mut app) = emulated_app();
+        let previous = app.active.correction.clone();
+        let mut correction = Correction::identity(Rate::Hz48000);
+        correction.name = "Pending exact selection".into();
+        let (view, _engine) = View::prepare(correction, app.settings.controls, &app.store).unwrap();
+        let requested = view.correction.clone();
+        let identity = view.hash;
+        app.awaiting = Some(view);
+        app.handle_audio_event(Event::State(Lifecycle::Stopped));
+        app.handle_audio_event(Event::ActivationRejected(
+            previous,
+            "Earlier playback stopped".into(),
+        ));
+        assert_eq!(app.awaiting.as_ref().unwrap().hash, identity);
+        app.handle_audio_event(Event::Activated(requested));
+        assert!(app.awaiting.is_none());
+        assert_eq!(app.active.hash, identity);
+        assert_eq!(app.store.load().unwrap().active, Some(identity));
+    }
+    #[test]
+    fn explicit_start_releases_old_measurement_event_ownership() {
+        let (_directory, mut app) = emulated_app();
+        let source = irresponsible::measurement::simulation::plan(Rate::Hz48000);
+        let receipt = app
+            .runtime
+            .send(Command::CheckLevels(
+                Box::new(source.clone()),
+                irresponsible::measurement::Speaker::Left,
+            ))
+            .unwrap();
+        let audio::Receipt::Measurement(id) = receipt else {
+            panic!("measurement receipt")
+        };
+        app.runtime.send(Command::CancelMeasurement).unwrap();
+        app.room.expected = Some(id);
+        app.room.muted = true;
+        app.submit_command(Command::Start(
+            source.route,
+            SystemOutput::RouteThroughCapture,
+        ))
+        .unwrap();
+        assert!(app.room.expected.is_none());
+        app.handle_audio_event(Event::MeasurementMuted(id));
+        assert!(!app.room.muted);
+    }
+    #[test]
+    fn save_shortcut_uses_room_candidate_and_rejects_missing_candidate() {
+        let (_directory, mut app) = emulated_app();
+        app.room.opened = true;
+        app.action(Action::SavePreset);
+        assert!(app.room.dialog.is_none());
+        assert!(app.text_focus.is_none());
+        let session =
+            irresponsible::measurement::validation::run(Default::default(), &app.store).unwrap();
+        let manifest =
+            irresponsible::measurement::workflow::Session::load(session, &app.store).unwrap();
+        let history = manifest.history(&app.store).unwrap();
+        let candidate = history[manifest.default_candidate(&history).unwrap().0]
+            .correction()
+            .unwrap();
+        let active = app.active.hash;
+        app.open_room_session(session).unwrap();
+        app.action(Action::SavePreset);
+        assert_eq!(app.room.dialog, Some(room::Dialog::PresetName));
+        assert!(
+            matches!(app.text_focus, Some(TextFocus::PresetName { source, .. })
+            if source == candidate)
+        );
+        assert_eq!(app.active.hash, active);
+    }
+    #[test]
+    fn global_preferences_leave_room_and_search_never_creates_hidden_focus() {
+        let (_directory, mut app) = emulated_app();
+        app.room.opened = true;
+        app.action(Action::Search);
+        assert!(app.text_focus.is_none());
+        assert!(app.browser == Browser::Catalog);
+        app.room.running = true;
+        app.action(Action::Preferences);
+        assert!(app.room.opened);
+        assert!(app.browser == Browser::Catalog);
+        assert!(app.message.contains("Stop"));
+        app.action(Action::Room(room::Action::Stop));
+        app.action(Action::Preferences);
+        assert!(!app.room.opened);
+        assert!(app.browser == Browser::General);
+    }
+    #[test]
+    fn global_shortcuts_preserve_room_modal_and_its_edit() {
+        let (_directory, mut app) = emulated_app();
+        app.room.opened = true;
+        app.room.dialog = Some(room::Dialog::MeasurementName);
+        app.text_focus = Some(TextFocus::Room {
+            target: room::Text::MeasurementName,
+            field: TextField::new("Pending measurement name".into()),
+            layout: None,
+        });
+        assert!(app.browser == Browser::Catalog);
+        for action in [Action::Preferences, Action::SavePreset, Action::Search] {
+            app.action(action);
+            assert!(app.browser == Browser::Catalog);
+            assert_eq!(app.room.dialog, Some(room::Dialog::MeasurementName));
+            assert!(
+                matches!(&app.text_focus, Some(TextFocus::Room { field, .. })
+                if field.text() == "Pending measurement name")
+            );
+        }
+    }
+    #[test]
+    fn emulated_launch_preserves_uncalibrated_measurement_acknowledgement() {
+        let (_directory, app) = emulated_app();
+        assert!(matches!(
+            app.settings.room.calibration,
+            irresponsible::measurement::Calibration::Uncalibrated {
+                acknowledged: false
+            }
+        ));
+    }
     fn app() -> (tempfile::TempDir, App) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path()).unwrap();
@@ -5068,7 +5592,7 @@ mod regression_tests {
         app.action(Action::Select(argentina));
         wait_for_preview(&mut app);
         assert_eq!(
-            app.preview.as_ref().unwrap().0.correction.target,
+            app.preview.as_ref().unwrap().0.correction.target(),
             Target::Flat
         );
         app.action(Action::Harman);
@@ -5080,7 +5604,7 @@ mod regression_tests {
         app.action(Action::Select(oratory));
         wait_for_preview(&mut app);
         assert_eq!(
-            app.preview.as_ref().unwrap().0.correction.target,
+            app.preview.as_ref().unwrap().0.correction.target(),
             Target::Harman
         );
         assert_eq!(
@@ -5108,7 +5632,7 @@ mod regression_tests {
         app.settings.catalog_target = None;
         app.save();
         let restored = App::new(app.store.clone()).unwrap();
-        assert_eq!(restored.active.correction.target, Target::Harman);
+        assert_eq!(restored.active.correction.target(), Target::Harman);
         assert_eq!(restored.catalog_target(), CatalogTarget::Reference);
     }
 
@@ -5206,7 +5730,7 @@ mod regression_tests {
         let endpoint = |id: &str| Endpoint {
             uid: DeviceUid::new(cpal::DeviceId::new(cpal::default_host().id(), id)),
             label: id.to_owned(),
-            pair: StereoPair::default(),
+            channels: StereoPair::default(),
         };
         app.settings.route = Some(Route {
             capture: endpoint("test-capture"),
@@ -6024,7 +6548,7 @@ mod regression_tests {
         restored.action(Action::ChooseAlignment(Alignment::OneKhz));
         wait_for_preview(&mut restored);
         let candidate = &restored.preview.as_ref().unwrap().0.correction;
-        assert!(candidate.measured.as_ref().unwrap().at(1000.0).abs() < 0.001);
+        assert!(candidate.measured().unwrap().at(1000.0).abs() < 0.001);
         assert!(
             matches!(candidate.origin,Origin::AutoEq {generation,..} if generation.alignment()==Alignment::OneKhz)
         );
@@ -6128,13 +6652,13 @@ mod regression_tests {
         restored.action(Action::Flat);
         wait_for_preview(&mut restored);
         assert_eq!(
-            restored.preview.as_ref().unwrap().0.correction.target,
+            restored.preview.as_ref().unwrap().0.correction.target(),
             Target::Flat
         );
         restored.action(Action::Harman);
         wait_for_preview(&mut restored);
         assert_eq!(
-            restored.preview.as_ref().unwrap().0.correction.target,
+            restored.preview.as_ref().unwrap().0.correction.target(),
             Target::Harman
         );
         assert!(Arc::ptr_eq(&playing, &restored.active.correction));
@@ -6201,7 +6725,7 @@ mod regression_tests {
         let endpoint = |id: &str| Endpoint {
             uid: DeviceUid::new(cpal::DeviceId::new(cpal::default_host().id(), id)),
             label: id.to_owned(),
-            pair: StereoPair::default(),
+            channels: StereoPair::default(),
         };
         app.settings.route = Some(Route {
             capture: endpoint("missing-autostart-capture"),

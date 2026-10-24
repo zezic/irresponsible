@@ -162,6 +162,7 @@ pub fn list_text_regions(bounds: Rect) -> (Rect, Rect) {
 
 #[derive(Clone, Copy)]
 pub enum Face {
+    Countdown,
     Title,
     Stat,
     Label,
@@ -172,6 +173,7 @@ pub enum Face {
 impl Face {
     fn size(self) -> f32 {
         match self {
+            Self::Countdown => 28.0,
             Self::Title | Self::Label | Self::Value => 12.0,
             Self::Stat => 11.5,
             Self::Small | Self::SmallValue => 10.0,
@@ -180,12 +182,12 @@ impl Face {
     fn family(self) -> &'static str {
         match self {
             Self::Title | Self::Stat | Self::Label | Self::Small => "Inter Display",
-            Self::Value | Self::SmallValue => "Iosevka",
+            Self::Value | Self::SmallValue | Self::Countdown => "Iosevka",
         }
     }
     fn tracking(self) -> f32 {
         match self {
-            Self::Value | Self::SmallValue => -self.size() * 0.1,
+            Self::Value | Self::SmallValue | Self::Countdown => -self.size() * 0.1,
             Self::Title | Self::Stat | Self::Label | Self::Small => 0.0,
         }
     }
@@ -239,6 +241,12 @@ impl<'a, A: Copy + PartialEq> Painter<'a, A> {
     }
     pub fn rect(&mut self, rect: Rect, color: Color) {
         self.rounded(rect, 0.0, color);
+    }
+    pub fn with_clip(&mut self, bounds: Rect, draw: impl FnOnce(&mut Self)) {
+        self.scene
+            .push_clip_layer(Fill::NonZero, Affine::scale(self.scale), &bounds);
+        draw(self);
+        self.scene.pop_layer();
     }
     pub fn rounded(&mut self, rect: Rect, radius: impl Into<RoundedRectRadii>, color: Color) {
         self.scene.fill(
@@ -423,9 +431,19 @@ impl<'a, A: Copy + PartialEq> Painter<'a, A> {
             x + self.advance(text, Face::Label).ceil() + INSET,
             y + CONTROL,
         );
+        self.button_at(bounds, text, action, selected, enabled);
+        bounds
+    }
+    pub fn button_at(
+        &mut self,
+        bounds: Rect,
+        text: &str,
+        action: A,
+        selected: bool,
+        enabled: bool,
+    ) {
         let ink = self.plate(bounds, action, selected, enabled);
         self.text(text, bounds, Face::Label, Align::Center, ink);
-        bounds
     }
     pub fn legend_chip(
         &mut self,
@@ -941,6 +959,29 @@ impl<'a, A: Copy + PartialEq> Painter<'a, A> {
         color: Color,
         width: f64,
     ) {
+        self.curve_stroke(curve, plot, color, Stroke::new(width));
+    }
+    pub fn curve_dashed(
+        &mut self,
+        curve: &irresponsible::correction::Curve,
+        plot: Rect,
+        color: Color,
+        width: f64,
+    ) {
+        self.curve_stroke(
+            curve,
+            plot,
+            color,
+            Stroke::new(width).with_dashes(0.0, [4.0, 3.0]),
+        );
+    }
+    fn curve_stroke(
+        &mut self,
+        curve: &irresponsible::correction::Curve,
+        plot: Rect,
+        color: Color,
+        stroke: Stroke,
+    ) {
         let max_hz = *curve.frequency.last().expect("validated curve");
         let mut path = BezPath::new();
         for (i, (&hz, &db)) in curve.frequency.iter().zip(&curve.db).enumerate() {
@@ -954,13 +995,8 @@ impl<'a, A: Copy + PartialEq> Painter<'a, A> {
         }
         self.scene
             .push_clip_layer(Fill::NonZero, Affine::scale(self.scale), &plot);
-        self.scene.stroke(
-            &Stroke::new(width),
-            Affine::scale(self.scale),
-            color,
-            None,
-            &path,
-        );
+        self.scene
+            .stroke(&stroke, Affine::scale(self.scale), color, None, &path);
         self.scene.pop_layer();
     }
 }

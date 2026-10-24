@@ -1,5 +1,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    Measurement(#[from] crate::measurement::workflow::Fault),
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]

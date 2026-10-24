@@ -9,6 +9,7 @@ use std::{io::Cursor, path::Path};
 
 mod autoeq;
 mod generation;
+pub mod room;
 pub use autoeq::{correction_curve, minimum_phase};
 pub use generation::{
     Alignment, BassExtension, ConchaInterference, FirLength, GenerationParameter,
@@ -94,6 +95,35 @@ pub struct WavSource {
     pub conversion: SampleConversion,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum GeneratedTarget {
+    Reference,
+    Harman,
+    Flat,
+}
+impl TryFrom<Target> for GeneratedTarget {
+    type Error = crate::error::Error;
+    fn try_from(target: Target) -> Result<Self> {
+        match target {
+            Target::Reference => Ok(Self::Reference),
+            Target::Harman => Ok(Self::Harman),
+            Target::Flat => Ok(Self::Flat),
+            _ => Err(invalid(
+                "Generated headphone correction requires a rig reference or flat target",
+            )),
+        }
+    }
+}
+impl From<GeneratedTarget> for Target {
+    fn from(target: GeneratedTarget) -> Self {
+        match target {
+            GeneratedTarget::Reference => Self::Reference,
+            GeneratedTarget::Harman => Self::Harman,
+            GeneratedTarget::Flat => Self::Flat,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Origin {
     Imported {
@@ -117,31 +147,92 @@ pub enum Origin {
         policy: String,
         #[serde(flatten)]
         generation: GenerationSettings,
+        target_kind: GeneratedTarget,
+        measured: Curve,
+        target_curve: Curve,
+    },
+    Room {
+        objective: ContentHash,
+        design_db: [Vec<f32>; 2],
+        alignment: room::SpeakerAlignment,
+        realized: room::Realization,
     },
     Identity,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Correction {
     pub name: String,
     pub rate: Rate,
     pub channels: [Vec<f32>; 2],
-    pub target: Target,
     pub origin: Origin,
-    pub measured: Option<Curve>,
-    pub target_curve: Option<Curve>,
+}
+
+// Read the original loose document once, moving headphone-only data into its source.
+impl<'de> Deserialize<'de> for Correction {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("origin").and_then(|v| v.get("AutoEq")).is_some() {
+            for (old, new) in [
+                ("target", "target_kind"),
+                ("measured", "measured"),
+                ("target_curve", "target_curve"),
+            ] {
+                if let Some(v) = value.as_object_mut().and_then(|v| v.remove(old)) {
+                    value["origin"]["AutoEq"]
+                        .as_object_mut()
+                        .ok_or_else(|| serde::de::Error::custom("Invalid headphone source"))?
+                        .entry(new)
+                        .or_insert(v);
+                }
+            }
+        }
+        #[derive(Deserialize)]
+        struct Document {
+            name: String,
+            rate: Rate,
+            channels: [Vec<f32>; 2],
+            origin: Origin,
+        }
+        let d: Document = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            name: d.name,
+            rate: d.rate,
+            channels: d.channels,
+            origin: d.origin,
+        })
+    }
 }
 
 impl Correction {
+    pub fn target(&self) -> Target {
+        match &self.origin {
+            Origin::PublishedAutoEq { .. } => Target::AutoEq,
+            Origin::AutoEq { target_kind, .. } => (*target_kind).into(),
+            _ => Target::Custom,
+        }
+    }
+    pub fn measured(&self) -> Option<&Curve> {
+        match &self.origin {
+            Origin::AutoEq { measured, .. } => Some(measured),
+            _ => None,
+        }
+    }
+    pub fn target_curve(&self) -> Option<&Curve> {
+        match &self.origin {
+            Origin::AutoEq { target_curve, .. } => Some(target_curve),
+            _ => None,
+        }
+    }
+
     pub fn identity(rate: Rate) -> Self {
         Self {
             name: "No correction".into(),
             rate,
             channels: [vec![1.0], vec![1.0]],
-            target: Target::Custom,
             origin: Origin::Identity,
-            measured: None,
-            target_curve: None,
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -153,6 +244,22 @@ impl Correction {
             return Err(invalid(
                 "WAV source has invalid sample-rate or delay metadata",
             ));
+        }
+        if let Origin::Room {
+            design_db,
+            alignment,
+            realized,
+            ..
+        } = &self.origin
+        {
+            alignment.validate()?;
+            realized.validate()?;
+            if design_db.iter().any(|d| {
+                d.len() != crate::measurement::analysis::grid().len()
+                    || d.iter().any(|v| !v.is_finite())
+            }) {
+                return Err(invalid("Invalid room correction design"));
+            }
         }
         for channel in &self.channels {
             if channel.is_empty()
@@ -169,7 +276,7 @@ impl Correction {
                 ));
             }
         }
-        for curve in [&self.measured, &self.target_curve].into_iter().flatten() {
+        for curve in [self.measured(), self.target_curve()].into_iter().flatten() {
             Curve::new(curve.frequency.clone(), curve.db.clone())?;
         }
         Ok(())
@@ -247,7 +354,6 @@ impl Correction {
             name: filename.into(),
             rate,
             channels,
-            target: Target::Custom,
             origin: Origin::Imported {
                 impulse: WavSource {
                     filename: filename.into(),
@@ -257,8 +363,6 @@ impl Correction {
                     conversion,
                 },
             },
-            measured: None,
-            target_curve: None,
         };
         ir.validate()?;
         Ok(ir)
@@ -288,6 +392,16 @@ impl Correction {
                 Ok(prepared)
             }
             Origin::Identity => Ok(Self::identity(rate)),
+            Origin::Room {
+                objective,
+                design_db,
+                ..
+            } => {
+                let mut frozen: room::Frozen = serde_json::from_slice(&store.get(objective)?)?;
+                frozen.rate = rate;
+                store.put(&serde_json::to_vec(&frozen)?)?;
+                Ok(room::render(&frozen, design_db, rate, &self.name)?.0)
+            }
             Origin::AutoEq { generation, .. } => {
                 if self.requires_regeneration() {
                     return Err(invalid(
@@ -295,12 +409,10 @@ impl Correction {
                     ));
                 }
                 let measured = self
-                    .measured
-                    .as_ref()
+                    .measured()
                     .ok_or_else(|| invalid("Generated correction is missing its measurement"))?;
                 let target = self
-                    .target_curve
-                    .as_ref()
+                    .target_curve()
                     .ok_or_else(|| invalid("Generated correction is missing its target"))?;
                 let coefficients = generated_impulse(measured, target, rate, *generation);
                 let mut ir = self.clone();
@@ -321,14 +433,14 @@ impl Correction {
             ));
         };
         let mut ir = self.clone();
-        let measured = ir
-            .measured
-            .as_mut()
-            .ok_or_else(|| invalid("Generated correction is missing its measurement"))?;
-        let target = ir
-            .target_curve
-            .as_mut()
-            .ok_or_else(|| invalid("Generated correction is missing its target"))?;
+        let Origin::AutoEq {
+            measured,
+            target_curve: target,
+            ..
+        } = &mut ir.origin
+        else {
+            unreachable!("checked generated source")
+        };
         measured.align(generation.alignment());
         target.align(generation.alignment());
         let coefficients = generated_impulse(measured, target, rate, generation);
@@ -353,7 +465,7 @@ impl Correction {
     fn wav_source(&self) -> Option<&WavSource> {
         match &self.origin {
             Origin::Imported { impulse } | Origin::PublishedAutoEq { impulse, .. } => Some(impulse),
-            Origin::Identity | Origin::AutoEq { .. } => None,
+            Origin::Identity | Origin::AutoEq { .. } | Origin::Room { .. } => None,
         }
     }
     pub fn into_published(
@@ -373,10 +485,20 @@ impl Correction {
             impulse,
         };
         self.name = name;
-        self.target = Target::AutoEq;
         self
     }
+    pub fn channel_trims(&self) -> [f32; 2] {
+        match &self.origin {
+            Origin::Room { alignment, .. } => {
+                alignment.trim_db.map(|db| 10f64.powf(db / 20.0) as f32)
+            }
+            _ => [1.0; 2],
+        }
+    }
     pub fn leading_delays(&self) -> [usize; 2] {
+        if let Origin::Room { alignment, .. } = &self.origin {
+            return alignment.frames(self.rate);
+        }
         self.wav_source().map_or([0, 0], |impulse| {
             impulse.leading_delay.map(|n| {
                 (n as f64 * self.rate.hz() as f64 / f64::from(impulse.original_rate)).round()

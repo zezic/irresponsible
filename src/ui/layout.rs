@@ -45,10 +45,88 @@ impl GraphLayout {
             toast,
         }
     }
+    pub const ROOM_CHROME_HEIGHT: f64 = CONTROL + INSET + CONTROL + GAP + CONTROL;
+    pub fn room(bounds: Rect, y: f64, plot_height: f64) -> Self {
+        let plot = Rect::new(
+            bounds.x0 + 36.0,
+            y + CONTROL + INSET,
+            bounds.x1,
+            y + CONTROL + INSET + plot_height,
+        );
+        let legend = Rect::new(
+            bounds.x0,
+            plot.y1 + CONTROL + GAP,
+            bounds.x1,
+            plot.y1 + CONTROL + GAP + CONTROL,
+        );
+        Self {
+            graph: Rect::new(bounds.x0, y, bounds.x1, legend.y1),
+            plot,
+            legend,
+            toast: None,
+        }
+    }
     pub fn compact(size: Size, chrome: WindowChrome, candidate: bool) -> Self {
         Self::new(
             Rect::new(0.0, chrome.height, size.width, size.height),
             candidate,
+        )
+    }
+}
+
+/// Shared page edges and vertical bands for the room workspace. Drawing receives
+/// content bounds: individual sections must not add another page gutter.
+pub struct RoomLayout {
+    pub navigation: Rect,
+    pub body: Rect,
+    pub actions: Rect,
+    pub status: Rect,
+}
+impl RoomLayout {
+    pub fn new(size: Size, chrome: WindowChrome) -> Self {
+        let status = Rect::new(0.0, size.height - 26.0, size.width, size.height);
+        let navigation = Rect::new(
+            INSET,
+            chrome.height + INSET,
+            size.width - INSET,
+            chrome.height + INSET + CONTROL,
+        );
+        let actions = Rect::new(
+            INSET,
+            status.y0 - CONTROL - 2.0 * INSET,
+            size.width - INSET,
+            status.y0,
+        );
+        let body = Rect::new(
+            INSET,
+            navigation.y1 + INSET,
+            size.width - INSET,
+            actions.y0 - INSET,
+        );
+        Self {
+            navigation,
+            body,
+            actions,
+            status,
+        }
+    }
+    pub fn columns(bounds: Rect) -> [Rect; 2] {
+        let half = (bounds.width() - INSET) * 0.5;
+        [
+            Rect::new(bounds.x0, bounds.y0, bounds.x0 + half, bounds.y1),
+            Rect::new(bounds.x1 - half, bounds.y0, bounds.x1, bounds.y1),
+        ]
+    }
+    pub fn route_columns(&self) -> [Rect; 2] {
+        let y = self.body.y0 + 2.0 * ROW;
+        Self::columns(Rect::new(self.body.x0, y, self.body.x1, y + CONTROL))
+    }
+    pub fn after_route(&self) -> Rect {
+        Rect::new(
+            self.body.x0,
+            self.route_columns()[0].y1 + INSET,
+            self.body.x1,
+            self.body.y1,
         )
     }
 }

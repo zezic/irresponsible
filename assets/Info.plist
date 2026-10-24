@@ -10,5 +10,5 @@
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSMicrophoneUsageDescription</key><string>IRresponsible captures the selected BlackHole audio device to apply headphone correction.</string>
+  <key>NSMicrophoneUsageDescription</key><string>IRresponsible captures routed audio for correction and a separately selected physical microphone to measure speakers and room response.</string>
 </dict></plist>

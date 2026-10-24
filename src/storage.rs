@@ -47,11 +47,15 @@ impl From<ContentHash> for String {
 pub enum SettingsDocument {
     #[serde(rename = "1")]
     V1(Settings),
+    #[serde(rename = "2")]
+    V2(Settings),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub measurements: std::collections::BTreeMap<ContentHash, String>,
+    pub room: crate::measurement::Preferences,
     pub route: Option<Route>,
     pub controls: Controls,
     pub active: Option<ContentHash>,
@@ -107,7 +111,9 @@ impl Store {
     pub fn load(&self) -> Result<Settings> {
         match fs::read(self.root.join("settings.json")) {
             Ok(bytes) => {
-                let SettingsDocument::V1(mut settings) = serde_json::from_slice(&bytes)?;
+                let (SettingsDocument::V1(mut settings) | SettingsDocument::V2(mut settings)) =
+                    serde_json::from_slice(&bytes)?;
+                settings.room.validate()?;
                 for name in settings.presets.values_mut() {
                     let length = preset_title(name).len();
                     name.truncate(length);
@@ -121,7 +127,7 @@ impl Store {
     pub fn save(&self, settings: &Settings) -> Result<()> {
         self.write(
             "settings.json",
-            &serde_json::to_vec_pretty(&SettingsDocument::V1(settings.clone()))?,
+            &serde_json::to_vec_pretty(&SettingsDocument::V2(settings.clone()))?,
         )
     }
     pub fn write(&self, filename: &str, bytes: &[u8]) -> Result<()> {

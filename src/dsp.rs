@@ -168,6 +168,7 @@ pub struct Engine {
     pub analysis: Analysis,
     convolvers: [Convolver; 2],
     dry: [Delay; 2],
+    dry_trims: [f32; 2],
     blend: f32,
     wet_gain: f32,
     dry_gain: f32,
@@ -180,6 +181,7 @@ impl Engine {
         let analysis = Analysis::new(&correction, controls);
         let delays = correction.leading_delays();
         let convolvers = correction.channels.each_ref().map(|c| Convolver::new(c));
+        let dry_trims = correction.channel_trims();
         let dry = delays.map(|n| Delay::new(PARTITION + n));
         let wet_gain = db_gain(analysis.headroom_db + analysis.wet_db);
         let dry_gain = db_gain(analysis.headroom_db + analysis.dry_db);
@@ -195,6 +197,7 @@ impl Engine {
             analysis,
             convolvers,
             dry,
+            dry_trims,
             blend: if controls.correction == CorrectionMode::On {
                 1.0
             } else {
@@ -223,7 +226,7 @@ impl Engine {
         self.dry_gain += (self.dry_target - self.dry_gain) * 0.002;
         std::array::from_fn(|c| {
             let wet = self.convolvers[c].tick(input[c]);
-            let dry = self.dry[c].tick(input[c]);
+            let dry = self.dry[c].tick(input[c]) * self.dry_trims[c];
             dry * self.dry_gain * (1.0 - self.blend) + wet * self.wet_gain * self.blend
         })
     }
@@ -275,6 +278,11 @@ impl Processor {
     }
     pub fn transitioning(&self) -> bool {
         self.transition.is_some()
+    }
+    pub fn pending_correction(&self) -> Option<&Arc<Correction>> {
+        self.transition
+            .as_ref()
+            .map(|transition| &transition.next.correction)
     }
     /// Returns true only after the replacement has finished warming and fading.
     pub fn tick(&mut self, input: Frame) -> (Frame, bool) {
