@@ -927,7 +927,7 @@ impl Run<'_> {
             .all(|&v| v + 2.0 * metrics.decision_uncertainty() <= 1.5);
         let complete = completed
             .iter()
-            .all(|pair| covers_objective(&frozen, &source, pair));
+            .all(|pair| covers_objective(&frozen, source, pair));
         let accepted = complete && stable && (improved || accurate);
         let reason = if accepted {
             if accurate {
