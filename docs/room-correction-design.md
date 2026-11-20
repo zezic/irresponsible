@@ -2,7 +2,7 @@
 
 IRresponsible measures a stereo speaker system with a separate mono microphone,
 creates a minimum-phase correction, and lets the listener compare and save it.
-The ordinary flow is Setup, Measure, Correction. Verification is optional.
+The ordinary flow is Measure, then Correction. Verification is optional.
 
 ## Setup and acquisition
 
@@ -109,7 +109,17 @@ source. Noise and repeatability inform the result; only complete evidence can
 verify the requested scope. Spatial checks retain partial evidence for resuming.
 A failed check does not erase an earlier usable filter.
 
-Setup and Measure contain routing controls. Correction shows the graph beside a
+Measure has two columns. The left one prepares the run: route, microphone
+calibration, speaker level and measurement settings, each headed by a state badge
+(ready, uncalibrated, not checked, hot, clipping). The level meter spans -60 to 0
+dBFS with the hot zone above -6 dBFS and the clipping edge marked, and shows each
+speaker's last check. The right one shows the single position or listening area as
+a top view drawn from the saved coordinates, a capture grid of positions by noise,
+left, right (and bass) takes read from the acquisition checkpoint, and the
+background noise with a steady/varied badge. The action bar estimates recording
+time and microphone moves.
+
+Correction shows the graph beside a
 settings column: target presets with a Custom target (tilt, bass shelf, mid bell)
 and import, smoothing, limits, effort and range, then collapsible advanced settings
 and measurement details. The graph draws the smoothed measurement, target,

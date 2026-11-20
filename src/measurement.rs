@@ -596,7 +596,7 @@ impl Noise {
             || self.crest_db > self.limits.maximum_crest_db
         {
             return Some(format!(
-                "Background varied: level variation {:.1} dB (warning above {:.1} dB), peak-to-average {:.1} dB (warning above {:.1} dB). Measurement continues; changing background can reduce confidence in affected bands. Adjust warning thresholds in Setup > Advanced acquisition settings.",
+                "Background varied: level variation {:.1} dB (warning above {:.1} dB), peak-to-average {:.1} dB (warning above {:.1} dB). Measurement continues; changing background can reduce confidence in affected bands.",
                 self.window_variation_db,
                 self.limits.maximum_variation_db,
                 self.crest_db,

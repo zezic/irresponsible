@@ -34,7 +34,7 @@ pub(super) fn render_preview(
     app.room.opened = true;
     app.message = "Drag effort knots on the graph; drag the smoothing band at its top.".into();
     app.room.stage = match state {
-        PreviewState::RoomSetup => Stage::Setup,
+        PreviewState::RoomMeasure => Stage::Measure,
         PreviewState::RoomVerification => Stage::Correction,
         _ => Stage::Correction,
     };
@@ -87,6 +87,7 @@ pub(super) fn smoke(destination: &std::path::Path, layout: measurement::Layout) 
         failure: None,
         ready: None,
         live_fit: None,
+        sweep_captured: false,
     };
     let event_loop = EventLoop::new().map_err(|e| invalid(e.to_string()))?;
     event_loop
@@ -131,6 +132,7 @@ struct NativeSmoke {
     failure: Option<String>,
     ready: Option<workflow::Movement>,
     live_fit: Option<measurement::Band>,
+    sweep_captured: bool,
 }
 impl NativeSmoke {
     fn capture(&mut self, name: &str) -> Result<()> {
@@ -226,21 +228,23 @@ impl NativeSmoke {
         );
     }
     fn inspect_controls(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        self.click(event_loop, super::Action::Room(Action::Stage(Stage::Setup)))?;
+        self.click(
+            event_loop,
+            super::Action::Room(Action::Stage(Stage::Measure)),
+        )?;
         self.click(event_loop, super::Action::Room(Action::MicrophoneChannel))?;
         self.capture("microphone-channel.png")?;
         self.click(
             event_loop,
             super::Action::Room(Action::ChooseMicrophoneChannel(MonoChannel(0))),
         )?;
-        self.click(event_loop, super::Action::Room(Action::Stage(Stage::Setup)))?;
-        self.capture("setup.png")?;
-        self.capture_at("setup-minimum.png", [880, 760])?;
+        self.capture("measure.png")?;
+        self.capture_at("measure-minimum.png", [880, 760])?;
         self.click_scrolled(
             event_loop,
             super::Action::Room(Action::Fold(Section::Acquisition)),
         )?;
-        self.capture_at("setup-expanded-minimum.png", [880, 760])?;
+        self.capture_at("measure-expanded-minimum.png", [880, 760])?;
         self.click(
             event_loop,
             super::Action::Room(Action::Stage(Stage::Correction)),
@@ -299,6 +303,13 @@ impl NativeSmoke {
                 }),
             )?;
             self.ready = Some(movement);
+        }
+        if matches!(self.phase, SmokePhase::Measurement)
+            && !self.sweep_captured
+            && matches!(self.app.room.progress, Some(Progress::Sweep { .. }))
+        {
+            self.capture("measuring.png")?;
+            self.sweep_captured = true;
         }
         if matches!(self.phase, SmokePhase::Measurement) {
             assert!(
@@ -375,7 +386,6 @@ impl NativeSmoke {
                     super::Action::Room(Action::Stage(Stage::Measure)),
                 )?;
                 self.capture("noise-advisory.png")?;
-                self.click(event_loop, super::Action::Room(Action::Stage(Stage::Setup)))?;
                 self.click(
                     event_loop,
                     super::Action::Room(Action::CheckLevel(measurement::Speaker::Right)),
@@ -582,9 +592,15 @@ impl ApplicationHandler for NativeSmoke {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    Setup,
+    /// Route, calibration, levels, positions and acquisition.
     Measure,
     Correction,
+}
+/// Whether acquisition covers one position or a guided area around it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Area {
+    Single,
+    Listening,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Dialog {
@@ -718,7 +734,7 @@ pub enum Action {
     LfDetail,
     HandsFree,
     Alignment,
-    ListeningArea,
+    SetArea(Area),
     SelectPass(PassId),
     BackToCandidate,
     Audition,
@@ -1063,7 +1079,6 @@ pub struct Workspace {
     settings_height: f64,
     graph: Rect,
     settings_bounds: Rect,
-    selected_point: usize,
     name: String,
     pub(super) return_to: Option<ListeningRestore>,
     plot_kind: PlotKind,
@@ -1092,7 +1107,7 @@ impl Default for Workspace {
             expected: None,
             active_plan: None,
             recovery: None,
-            stage: Stage::Setup,
+            stage: Stage::Measure,
             dialog: None,
             expanded: Default::default(),
             session: None,
@@ -1107,7 +1122,6 @@ impl Default for Workspace {
             settings_height: 0.0,
             graph: Rect::ZERO,
             settings_bounds: Rect::ZERO,
-            selected_point: 0,
             name: "Listening room".into(),
             return_to: None,
             plot_kind: PlotKind::RoomResponse,
@@ -1361,7 +1375,7 @@ impl App {
                 self.room.stage = if self.room.session.is_some() {
                     self::Stage::Correction
                 } else {
-                    self::Stage::Setup
+                    self::Stage::Measure
                 };
             }
             Close => {
@@ -1371,8 +1385,7 @@ impl App {
                 self.room.opened = false;
             }
             Stage(stage) => {
-                if !self.room.running && matches!(stage, self::Stage::Setup | self::Stage::Measure)
-                {
+                if !self.room.running && stage == self::Stage::Measure {
                     self.room.recovery = workflow::Recovery::load(&self.store)?;
                 }
                 self.room.stage = stage;
@@ -1515,7 +1528,7 @@ impl App {
             }
             Calibration => {
                 self.room.dialog = None;
-                self.room.stage = self::Stage::Setup;
+                self.room.stage = self::Stage::Measure;
                 self.room.settings_scroll = 0.0;
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Measured microphone response: Hz, dB, optional degrees")
@@ -1593,13 +1606,11 @@ impl App {
             }
             Alignment => self.open_picker(PickerKind::RoomChoice(ChoiceField::Alignment)),
 
-            ListeningArea => {
-                self.settings.room.layout = if self.settings.room.layout.positions.len() > 1 {
-                    measurement::Layout::default()
-                } else {
-                    measurement::Layout::around_listener()
+            SetArea(area) => {
+                self.settings.room.layout = match area {
+                    self::Area::Single => measurement::Layout::default(),
+                    self::Area::Listening => measurement::Layout::around_listener(),
                 };
-                self.room.selected_point = 0;
                 self.save();
             }
 
@@ -1783,7 +1794,6 @@ impl App {
         self.settings.room.gain = source.plan.gain.clone();
         self.settings.room.acquisition = source.plan.acquisition.clone();
         self.settings.room.microphone = Some(source.plan.microphone.clone());
-        self.room.selected_point = 0;
         if let Some(p) = self.room.history.last() {
             let frozen: correction::Frozen =
                 serde_json::from_slice(&self.store.get(&p.objective)?)?;
@@ -2307,7 +2317,10 @@ impl App {
                     self.room.settings_scroll = 0.0;
                 }
             }
-            Progress::Sweep { band, .. } => self.room.active_band = Some(*band),
+            Progress::Sweep { band, .. } => {
+                self.room.active_band = Some(*band);
+                self.reload_room_recovery();
+            }
             Progress::Finished { session, reason } => {
                 self.room.running = false;
                 self.room.active_plan = None;
@@ -2340,22 +2353,28 @@ impl App {
                 self.room.active_plan = None;
                 self.room.active_band = None;
                 self.message = error.clone();
-                match workflow::Recovery::load(&self.store) {
-                    Ok(recovery) => self.room.recovery = recovery,
-                    Err(recovery_error) => {
-                        self.message = format!(
-                            "{error}. Could not read saved acquisition progress: {recovery_error}"
-                        )
-                    }
-                }
+                self.reload_room_recovery();
             }
             Progress::Background { .. } => {
                 self.room.active_band = None;
                 self.room.latest_noise = None;
+                self.reload_room_recovery();
             }
-            Progress::Move { .. } => self.room.active_band = None,
+            Progress::Move { .. } => {
+                self.room.active_band = None;
+                self.reload_room_recovery();
+            }
         }
         self.room.progress = Some(progress);
+    }
+    /// The saved acquisition checkpoint shows which captures are already kept.
+    fn reload_room_recovery(&mut self) {
+        match workflow::Recovery::load(&self.store) {
+            Ok(recovery) => self.room.recovery = recovery,
+            Err(error) => {
+                self.message = format!("Could not read saved acquisition progress: {error}")
+            }
+        }
     }
     fn room_frequency(&self, x: f64) -> f64 {
         20.0 * 1000f64.powf(((x - self.room.graph.x0) / self.room.graph.width()).clamp(0.0, 1.0))
@@ -2811,10 +2830,7 @@ impl App {
         let navigation_y = geometry.navigation.y0;
         let bottom = geometry.status.y0;
         let center = geometry.actions;
-        let content = match self.room.stage {
-            Stage::Correction => geometry.body,
-            Stage::Setup | Stage::Measure => geometry.after_route(),
-        };
+        let content = geometry.body;
         let smoothing = self.room_recipe().smoothing;
         if let Some(data) = &mut self.room.plot_data {
             data.refresh_smoothed(smoothing, self.room.point_view);
@@ -2840,6 +2856,8 @@ impl App {
             .collect();
         let options = self.picker.as_ref().map(|_| self.filtered_picker_options());
         let status = room_status(&self.room, &preferences);
+        let estimate = workflow::Estimate::for_preferences(&preferences, self.current_rate())
+            .expect("room preferences are validated on every edit");
         let mut p = Painter::new(
             &mut self.fonts,
             &mut self.layout,
@@ -2960,67 +2978,10 @@ impl App {
             !self.room.running,
         );
 
-        if self.room.stage != Stage::Correction {
-            let mut route = Form::new(geometry.body, geometry.body.y0, route_editable);
-            route.section(&mut p, "Measurement route", Icon::PlugsConnected);
-            let [microphone, playback] = geometry.route_columns();
-            for (column, label) in [
-                (microphone, "Measurement microphone"),
-                (playback, "Speaker playback"),
-            ] {
-                p.text(
-                    label,
-                    Rect::new(
-                        column.x0,
-                        column.y0 - ROW,
-                        column.x1,
-                        column.y0 - ROW + CONTROL,
-                    ),
-                    Face::Small,
-                    Align::Start,
-                    colors.secondary,
-                );
-            }
-            let (device, channel) = layout::Layout::split_route(microphone);
-            let mic = preferences.microphone.as_ref();
-            p.dropdown(
-                device,
-                mic.map_or("Choose microphone", |m| m.label.as_str()),
-                super::Action::Room(Action::Microphone),
-                !self.room.running,
-            );
-            p.dropdown(
-                channel,
-                &mic.map_or_else(|| "--".into(), |m| (m.channels.0 + 1).to_string()),
-                super::Action::Room(Action::MicrophoneChannel),
-                mic.is_some() && !self.room.running,
-            );
-            let (device, channel) = layout::Layout::split_route(playback);
-            let output = self.settings.route.as_ref().map(|r| &r.playback);
-            p.dropdown(
-                device,
-                output.map_or("Choose playback", |d| d.label.as_str()),
-                super::Action::Playback,
-                route_editable,
-            );
-            p.dropdown(
-                channel,
-                &output.map_or_else(
-                    || "--".into(),
-                    |d| {
-                        let [l, r] = d.channels.indices();
-                        format!("{} / {}", l + 1, r + 1)
-                    },
-                ),
-                super::Action::PlaybackPair,
-                output.is_some() && route_editable,
-            );
-        }
         let mut x = geometry.navigation.x0;
         for (label, stage) in [
-            ("1  Setup", Stage::Setup),
-            ("2  Measure", Stage::Measure),
-            ("3  Correction", Stage::Correction),
+            ("1  Measure", Stage::Measure),
+            ("2  Correction", Stage::Correction),
         ] {
             x =
                 p.chip(
@@ -3060,10 +3021,12 @@ impl App {
             preparing: self.job.is_some(),
             parameters: &parameters,
             measurements: &self.settings.measurements,
+            route: self.settings.route.as_ref(),
+            route_editable,
         };
         let (height, graph, scrollport) = match self.room.stage {
-            Stage::Setup => (
-                draw_setup(
+            Stage::Measure => (
+                draw_measure(
                     &mut p,
                     content,
                     origin,
@@ -3074,17 +3037,6 @@ impl App {
                 Rect::ZERO,
                 content,
             ),
-            Stage::Measure => {
-                let (height, graph) = draw_measurement(
-                    &mut p,
-                    content,
-                    origin,
-                    &view,
-                    &mut self.text_focus,
-                    self.peaks.0,
-                );
-                (height, graph, content)
-            }
             Stage::Correction => {
                 let [graph_column, sidebar] = correction_columns(content);
                 let plot = draw_correction(&mut p, graph_column, &view, &status);
@@ -3125,6 +3077,7 @@ impl App {
             &preferences,
             self.job.is_some(),
             listening,
+            &estimate,
         );
         p.rect(Rect::new(0.0, bottom, size.width, size.height), colors.bg);
         p.text(
@@ -3208,6 +3161,8 @@ impl App {
                 preparing: self.job.is_some(),
                 parameters: &parameters,
                 measurements: &self.settings.measurements,
+                route: self.settings.route.as_ref(),
+                route_editable,
             };
             let start_hits = p.hits.len();
             p.scene.push_clip_layer(
@@ -3393,6 +3348,9 @@ struct SettingsView<'a> {
     preparing: bool,
     parameters: &'a [(Parameter, f64)],
     measurements: &'a std::collections::BTreeMap<ContentHash, String>,
+    route: Option<&'a Route>,
+    /// Playback can change only while listening streams are stopped.
+    route_editable: bool,
 }
 fn alignment_label(alignment: correction::Alignment) -> &'static str {
     match alignment {
@@ -3512,6 +3470,25 @@ impl Form {
         }
         self.y += ROW;
     }
+    fn section_with_badge(
+        &mut self,
+        p: &mut Painter<'_, super::Action>,
+        title: &str,
+        icon: Icon,
+        label: &str,
+        tone: Tone,
+    ) {
+        let start = self.y;
+        self.section(p, title, icon);
+        let y = self.y - CONTROL - GAP;
+        debug_assert!(y >= start);
+        badge(
+            p,
+            Rect::new(self.bounds.x0, y, self.bounds.x1, y + CONTROL),
+            label,
+            tone,
+        );
+    }
     fn section(&mut self, p: &mut Painter<'_, super::Action>, title: &str, icon: Icon) {
         if self.y > self.bounds.y0 {
             p.line(
@@ -3628,7 +3605,247 @@ fn draw_recovery(p: &mut Painter<'_, super::Action>, form: &mut Form, workspace:
         form.note(p,"Resume restores its saved microphone, levels, sweep settings and locations. Starting a new measurement begins a fresh acquisition.");
     }
 }
-fn draw_setup(
+/// Input peak on a -60..0 dBFS scale with the hot zone and the clipping edge marked.
+fn draw_level_meter(p: &mut Painter<'_, super::Action>, bounds: Rect, w: &Workspace, live: f32) {
+    const FLOOR_DB: f32 = -60.0;
+    let colors = p.colors;
+    let live_capture = w.running
+        && matches!(
+            w.progress,
+            Some(Progress::Levels { .. } | Progress::Background { .. } | Progress::Sweep { .. })
+        );
+    let bar = Rect::new(bounds.x0, bounds.y0 + 4.0, bounds.x1, bounds.y0 + 12.0);
+    let x = |peak: f32| {
+        let db = 20.0 * peak.max(1e-12).log10();
+        bar.x0 + bar.width() * f64::from(((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0))
+    };
+    let tone = |peak: f32| {
+        if peak >= measurement::io::INPUT_CLIPPING_PEAK {
+            Tone::Bad
+        } else if peak >= measurement::levels::RECOMMENDED_CHECK_PEAK {
+            Tone::Warning
+        } else {
+            Tone::Good
+        }
+    };
+    p.rounded(bar, 2.0, colors.ghost);
+    let hot = x(measurement::levels::RECOMMENDED_CHECK_PEAK);
+    p.rect(
+        Rect::new(hot, bar.y0, bar.x1, bar.y1),
+        opacity(Tone::Warning.color(colors), 0.25),
+    );
+    p.line(
+        (bar.x1, bounds.y0),
+        (bar.x1, bar.y1 + 4.0),
+        Tone::Bad.color(colors),
+        2.0,
+    );
+    let label = |p: &mut Painter<'_, super::Action>, text: String, at: Rect, align: Align, ink| {
+        p.text(&text, at, Face::Small, align, ink)
+    };
+    let caption = Rect::new(bounds.x0, bar.y1 + 4.0, bounds.x1, bounds.y1);
+    if live_capture {
+        p.rounded(
+            Rect::new(bar.x0, bar.y0, x(live), bar.y1),
+            2.0,
+            tone(live).color(colors),
+        );
+        let db = 20.0 * live.max(1e-12).log10();
+        label(
+            p,
+            if db < FLOOR_DB {
+                format!("Input peak below {FLOOR_DB:.0} dBFS")
+            } else {
+                format!("Input peak {db:.1} dBFS")
+            },
+            caption,
+            Align::Start,
+            colors.secondary,
+        );
+    } else if w.running {
+        label(
+            p,
+            "Microphone idle / output silent".into(),
+            caption,
+            Align::Start,
+            colors.secondary,
+        );
+    } else {
+        let mut text = Vec::new();
+        for speaker in measurement::Speaker::ALL {
+            let Some(report) = &w.levels[speaker.index()] else {
+                continue;
+            };
+            let at = x(report.input_peak);
+            p.line(
+                (at, bar.y0 - 3.0),
+                (at, bar.y1 + 3.0),
+                tone(report.input_peak).color(colors),
+                2.0,
+            );
+            text.push(format!(
+                "{} {:.1} dBFS",
+                speaker_name(speaker),
+                20.0 * report.input_peak.log10()
+            ));
+        }
+        if text.is_empty() {
+            text.push("No level check yet".into());
+        }
+        label(p, text.join(" / "), caption, Align::Start, colors.secondary);
+    }
+    label(
+        p,
+        "Hot above -6 / clip at 0 dBFS".into(),
+        caption,
+        Align::End,
+        colors.secondary,
+    );
+}
+/// How a state badge reads at a glance.
+#[derive(Clone, Copy)]
+enum Tone {
+    Neutral,
+    Good,
+    Warning,
+    Bad,
+}
+impl Tone {
+    fn color(self, colors: appearance::Colors) -> vello::peniko::Color {
+        match self {
+            Self::Neutral => colors.secondary,
+            Self::Good => colors.basic[2],
+            Self::Warning => colors.basic[3],
+            Self::Bad => colors.basic[1],
+        }
+    }
+}
+fn badge(p: &mut Painter<'_, super::Action>, row: Rect, label: &str, tone: Tone) {
+    let ink = tone.color(p.colors);
+    let width = p.advance(label, Face::Small).ceil() + 2.0 * GAP;
+    let bounds = Rect::new(row.x1 - width, row.y0 + 2.0, row.x1, row.y1 - 2.0);
+    p.rounded(bounds, RADIUS, opacity(ink, 0.16));
+    p.text(label, bounds, Face::Small, Align::Center, ink);
+}
+
+/// One capture of the acquisition sequence at a position, in recording order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Capture {
+    Noise,
+    Full(measurement::Speaker),
+    Bass(measurement::Speaker),
+    Repeat(measurement::Speaker),
+}
+impl Capture {
+    fn sequence(lf: bool, reference: bool) -> impl Iterator<Item = Self> {
+        let speakers = |take: fn(measurement::Speaker) -> Self| measurement::Speaker::ALL.map(take);
+        std::iter::once(Self::Noise)
+            .chain(speakers(Self::Full))
+            .chain(lf.then(|| speakers(Self::Bass)).into_iter().flatten())
+            .chain(
+                reference
+                    .then(|| speakers(Self::Repeat))
+                    .into_iter()
+                    .flatten(),
+            )
+    }
+    fn saved(
+        self,
+        point: &workflow::PointCheckpoint,
+        repeat: &[Option<measurement::Take>; 2],
+    ) -> bool {
+        match self {
+            Self::Noise => point.noise.is_some(),
+            Self::Full(s) => point.full[s.index()].is_some(),
+            Self::Bass(s) => point.lf[s.index()].is_some(),
+            Self::Repeat(s) => repeat[s.index()].is_some(),
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureState {
+    Pending,
+    Recording,
+    Saved,
+}
+/// Capture states per position of the acquisition shown on the Measure stage.
+struct Captures {
+    lf: bool,
+    states: Vec<Vec<(Capture, CaptureState)>>,
+}
+impl Captures {
+    fn new(w: &Workspace, layout: &measurement::Layout, lf: bool) -> Self {
+        let checkpoint = match &w.recovery {
+            Some(workflow::Recovery::Acquisition(checkpoint))
+                if checkpoint.points.len() == layout.positions.len() =>
+            {
+                Some(checkpoint)
+            }
+            _ => None,
+        };
+        let completed = !w.running
+            && checkpoint.is_none()
+            && w.source
+                .as_ref()
+                .is_some_and(|s| s.points.len() == layout.positions.len());
+        let recording = match w.progress {
+            Some(Progress::Background { position } | Progress::Sweep { position, .. })
+                if w.running && w.active_plan.as_ref().is_some_and(|p| p.kind.acquires()) =>
+            {
+                Some(position)
+            }
+            _ => None,
+        };
+        let states = (0..layout.positions.len())
+            .map(|position| {
+                let mut current = recording == Some(position);
+                Capture::sequence(lf, position == layout.reference)
+                    .map(|capture| {
+                        let saved = completed
+                            || checkpoint.is_some_and(|c| {
+                                capture.saved(&c.points[position], &c.repeat_reference)
+                            });
+                        let state = if saved {
+                            CaptureState::Saved
+                        } else if current {
+                            current = false;
+                            CaptureState::Recording
+                        } else {
+                            CaptureState::Pending
+                        };
+                        (capture, state)
+                    })
+                    .collect()
+            })
+            .collect();
+        Self { lf, states }
+    }
+    fn position_done(&self, position: usize) -> bool {
+        self.states[position]
+            .iter()
+            .all(|(_, s)| *s == CaptureState::Saved)
+    }
+    fn state(&self, position: usize, capture: Capture) -> Option<CaptureState> {
+        self.states[position]
+            .iter()
+            .find(|(c, _)| *c == capture)
+            .map(|(_, s)| *s)
+    }
+}
+
+/// The position the run is at or asks for next.
+fn active_position(w: &Workspace) -> Option<usize> {
+    match w.progress {
+        Some(Progress::Move { movement, .. }) => Some(movement.position()),
+        Some(Progress::Background { position } | Progress::Sweep { position, .. }) if w.running => {
+            Some(position)
+        }
+        _ => None,
+    }
+}
+
+/// Merged preparation and acquisition stage. Returns the content height.
+fn draw_measure(
     p: &mut Painter<'_, super::Action>,
     bounds: Rect,
     top: f64,
@@ -3636,37 +3853,155 @@ fn draw_setup(
     focus: &mut Option<TextFocus>,
     peak: f32,
 ) -> f64 {
-    let prefs = view.preferences;
     let w = view.workspace;
-    heading(
-        p,
-        bounds,
-        top,
-        "Set up your measurement",
-        "Place the microphone at ear height. Keep speaker volume and microphone gain fixed.",
-        None,
-    );
-    let [left, right] =
-        layout::RoomLayout::columns(Rect::new(bounds.x0, top + 64.0, bounds.x1, bounds.y1));
-    let mut f = Form::new(left, left.y0, !w.running);
+    let prefs = view.preferences;
+    let mut y = top;
+    if w.running || matches!(w.progress, Some(Progress::Failed(_))) {
+        draw_run_banner(
+            p,
+            Rect::new(bounds.x0, y, bounds.x1, y + 76.0),
+            w,
+            prefs,
+            &room_status(w, prefs),
+        );
+        y += 88.0;
+    }
+    let [left, right] = layout::RoomLayout::columns(Rect::new(bounds.x0, y, bounds.x1, bounds.y1));
+    let left = draw_preparation(p, left, view, focus, peak);
+    let right = draw_positions(p, right, view, focus);
+    left.max(right) - top + INSET
+}
+
+/// Route, calibration, speaker level and acquisition settings. Returns the bottom edge.
+fn draw_preparation(
+    p: &mut Painter<'_, super::Action>,
+    bounds: Rect,
+    view: &SettingsView<'_>,
+    focus: &mut Option<TextFocus>,
+    peak: f32,
+) -> f64 {
+    let w = view.workspace;
+    let prefs = view.preferences;
+    let mut f = Form::new(bounds, bounds.y0, !w.running);
     draw_recovery(p, &mut f, w);
-    f.section(p, "Microphone calibration", Icon::PlugsConnected);
-    f.button(p, "Choose calibration file...", Action::Calibration);
+
+    let microphone = prefs.microphone.as_ref();
+    let playback = view.route.map(|r| &r.playback);
+    let (label, tone) = match (microphone, playback) {
+        (None, _) => ("Choose microphone", Tone::Warning),
+        (_, None) => ("Choose speakers", Tone::Warning),
+        _ => ("Ready", Tone::Good),
+    };
+    f.section_with_badge(p, "Route", Icon::PlugsConnected, label, tone);
+    for (caption, device, channel, device_action, channel_action, device_enabled) in [
+        (
+            "Microphone",
+            microphone.map_or("Choose microphone", |m| m.label.as_str()),
+            microphone.map_or_else(|| "--".into(), |m| (m.channels.0 + 1).to_string()),
+            super::Action::Room(Action::Microphone),
+            super::Action::Room(Action::MicrophoneChannel),
+            !w.running,
+        ),
+        (
+            "Speakers",
+            playback.map_or("Choose playback", |d| d.label.as_str()),
+            playback.map_or_else(
+                || "--".into(),
+                |d| {
+                    let [l, r] = d.channels.indices();
+                    format!("{} / {}", l + 1, r + 1)
+                },
+            ),
+            super::Action::Playback,
+            super::Action::PlaybackPair,
+            view.route_editable,
+        ),
+    ] {
+        let row = f.row();
+        let caption_width = 84.0;
+        p.text(
+            caption,
+            Rect::new(row.x0, row.y0, row.x0 + caption_width, row.y1),
+            Face::Label,
+            Align::Start,
+            p.colors.secondary,
+        );
+        let (device_bounds, channel_bounds) =
+            layout::Layout::split_route(Rect::new(row.x0 + caption_width, row.y0, row.x1, row.y1));
+        p.dropdown(device_bounds, device, device_action, device_enabled);
+        p.dropdown(
+            channel_bounds,
+            &channel,
+            channel_action,
+            device_enabled && device != "Choose microphone" && device != "Choose playback",
+        );
+        f.y += ROW;
+    }
+    if !view.route_editable && !w.running {
+        f.note(p, "Pause listening to change the speaker route.");
+    }
+
+    let (label, tone) = match &prefs.calibration {
+        measurement::Calibration::Uncalibrated { .. } => ("Uncalibrated", Tone::Warning),
+        measurement::Calibration::Response { .. } => ("Calibrated", Tone::Good),
+    };
+    f.section_with_badge(
+        p,
+        "Microphone calibration",
+        Icon::PlugsConnected,
+        label,
+        tone,
+    );
     match &prefs.calibration {
-        measurement::Calibration::Uncalibrated { .. } => f.note(p, "No calibration file. You can continue, but microphone coloration will affect the result."),
-        measurement::Calibration::Response { orientation, metadata, .. } => {
-            if let Some(name) = metadata.first() { f.note(p, name); }
-            f.dropdown(p, "Orientation", orientation_label(*orientation), ChoiceField::Orientation);
-            f.button(p, "Remove calibration", Action::RemoveCalibration);
+        measurement::Calibration::Uncalibrated { .. } => {
+            f.note(
+                p,
+                "Without a response file the microphone's own coloration ends up in the correction.",
+            );
+            f.button(p, "Load calibration file...", Action::Calibration);
+        }
+        measurement::Calibration::Response {
+            orientation,
+            metadata,
+            ..
+        } => {
+            if let Some(name) = metadata.first() {
+                f.note(p, name);
+            }
+            f.dropdown(
+                p,
+                "Orientation",
+                orientation_label(*orientation),
+                ChoiceField::Orientation,
+            );
+            let end = p
+                .button(
+                    bounds.x0,
+                    f.y,
+                    "Replace...",
+                    super::Action::Room(Action::Calibration),
+                    f.enabled,
+                )
+                .x1;
+            p.button(
+                end + GAP,
+                f.y,
+                "Remove",
+                super::Action::Room(Action::RemoveCalibration),
+                f.enabled,
+            );
+            f.y += ROW;
         }
     }
-    f.section(p, "Check speaker level", Icon::Waveform);
+
+    let (label, tone) = level_badge(&w.levels);
+    f.section_with_badge(p, "Speaker level", Icon::Waveform, label, tone);
     f.number(p, view, Parameter::ProbeLevel, focus);
-    draw_level_meter(p, Rect::new(left.x0, f.y, left.x1, f.y + 36.0), w, peak);
-    f.y += 44.0;
+    draw_level_meter(p, Rect::new(bounds.x0, f.y, bounds.x1, f.y + 40.0), w, peak);
+    f.y += 48.0;
     let end = p
         .button(
-            left.x0,
+            bounds.x0,
             f.y,
             "Check left",
             super::Action::Room(Action::CheckLevel(measurement::Speaker::Left)),
@@ -3680,11 +4015,13 @@ fn draw_setup(
         super::Action::Room(Action::CheckLevel(measurement::Speaker::Right)),
         f.enabled,
     );
-    f.y += 36.0;
+    f.y += ROW + 4.0;
     f.note(
         p,
-        "Begin quietly. Disable direct monitoring and voice processing on the microphone input.",
+        "Optional. Begin quietly; disable direct monitoring and voice processing on the microphone input.",
     );
+
+    f.y += GAP;
     if f.fold(p, w, Section::Acquisition, "Measurement settings") {
         for parameter in [Parameter::Sweep, Parameter::Tail, Parameter::Noise] {
             f.number(p, view, parameter, focus);
@@ -3700,311 +4037,332 @@ fn draw_setup(
                 f.number(p, view, parameter, focus);
             }
         }
+        if let Some(noise) = latest_noise(w) {
+            let graph = Rect::new(bounds.x0 + 40.0, f.y + 8.0, bounds.x1, f.y + 108.0);
+            draw_noise_graph(p, graph, noise);
+            f.y += 140.0;
+            f.note(
+                p,
+                &format!(
+                    "Noise-level variation {:.1} dB (warning above {:.1} dB). Peak-to-average {:.1} dB (warning above {:.1} dB). Background sets uncertainty; it is not subtracted from the room response.",
+                    noise.window_variation_db,
+                    noise.limits.maximum_variation_db,
+                    noise.crest_db,
+                    noise.limits.maximum_crest_db,
+                ),
+            );
+        }
     }
-    let mut area = Form::new(right, right.y0, !w.running);
-    area.section(p, "Listening area", Icon::Circle);
-    area.toggle(
-        p,
-        "Measure around the listening position",
-        Action::ListeningArea,
-        prefs.layout.positions.len() > 1,
-    );
-    area.note(p, "Start at your usual head position. For an area measurement, follow the nearby positions below, keeping the microphone on a stand.");
-    for (i, point) in prefs.layout.positions.iter().enumerate() {
-        p.text(
-            &format!("{}. {}", i + 1, point.name),
-            area.row(),
-            Face::Label,
-            Align::Start,
-            p.colors.fg,
-        );
-        area.y += 28.0;
-    }
-    area.y += 12.0;
-    area.toggle(
-        p,
-        "Countdown between positions",
-        Action::HandsFree,
-        matches!(prefs.progression, workflow::Progression::HandsFree { .. }),
-    );
-    if matches!(prefs.progression, workflow::Progression::HandsFree { .. }) {
-        area.number(p, view, Parameter::MoveSeconds, focus);
-    }
-    area.note(p, "One correction is created after measurement. You can listen immediately or measure the result separately.");
-    f.y.max(area.y) - top + INSET
+    f.y
 }
-fn draw_level_meter(p: &mut Painter<'_, super::Action>, bounds: Rect, w: &Workspace, live: f32) {
-    let report = match w.progress {
-        Some(Progress::Levels { speaker }) => w.levels[speaker.index()].as_ref(),
-        _ => w.levels.iter().flatten().next(),
-    };
-    let live_capture = w.running
-        && matches!(
-            w.progress,
-            Some(Progress::Levels { .. } | Progress::Background { .. } | Progress::Sweep { .. })
-        );
-    let peak = if live_capture {
-        Some(live)
-    } else if w.running {
-        None
-    } else {
-        report.map(|r| r.input_peak)
-    };
-    p.rounded(
-        Rect::new(bounds.x0, bounds.y0 + 4.0, bounds.x1, bounds.y0 + 12.0),
-        2.0,
-        p.colors.ghost,
-    );
-    if let Some(peak) = peak {
-        let db = 20.0 * peak.max(1e-12).log10();
-        let fraction = f64::from(((db + 72.0) / 72.0).clamp(0.0, 1.0));
-        p.rounded(
-            Rect::new(
-                bounds.x0,
-                bounds.y0 + 4.0,
-                bounds.x0 + bounds.width() * fraction,
-                bounds.y0 + 12.0,
-            ),
-            2.0,
-            if peak >= measurement::io::INPUT_CLIPPING_PEAK {
-                p.colors.basic[1]
-            } else if peak >= measurement::levels::RECOMMENDED_CHECK_PEAK {
-                p.colors.basic[3]
-            } else {
-                p.colors.basic[2]
-            },
-        );
-        p.text(
-            &format!(
-                "{} {db:.1} dBFS",
-                if live_capture {
-                    "Input peak"
-                } else {
-                    "Previous check peak"
-                }
-            ),
-            Rect::new(bounds.x0, bounds.y0 + 16.0, bounds.center().x, bounds.y1),
-            Face::SmallValue,
-            Align::Start,
-            p.colors.secondary,
-        );
-        p.text(
-            &format!("{:.1} dB input headroom", -db),
-            Rect::new(bounds.center().x, bounds.y0 + 16.0, bounds.x1, bounds.y1),
-            Face::Small,
-            Align::End,
-            p.colors.secondary,
-        );
-    } else {
-        p.text(
-            if w.running {
-                "Microphone idle / output silent"
-            } else {
-                "No speaker level check recorded"
-            },
-            Rect::new(bounds.x0, bounds.y0 + 16.0, bounds.x1, bounds.y1),
-            Face::Small,
-            Align::Start,
-            p.colors.secondary,
-        );
+
+/// Badge for the recorded speaker level checks; the worst check decides the tone.
+fn level_badge(levels: &[Option<measurement::levels::Report>; 2]) -> (&'static str, Tone) {
+    let peaks = levels.each_ref().map(|r| r.as_ref().map(|r| r.input_peak));
+    let worst = peaks.iter().flatten().copied().fold(0.0, f32::max);
+    match peaks {
+        [None, None] => ("Not checked", Tone::Neutral),
+        _ if worst >= measurement::io::INPUT_CLIPPING_PEAK => ("Clipping", Tone::Bad),
+        _ if worst >= measurement::levels::RECOMMENDED_CHECK_PEAK => ("Hot", Tone::Warning),
+        [Some(_), Some(_)] => ("Both checked", Tone::Good),
+        [Some(_), None] => ("Left checked", Tone::Good),
+        [None, Some(_)] => ("Right checked", Tone::Good),
     }
 }
-fn draw_measurement(
-    p: &mut Painter<'_, super::Action>,
-    bounds: Rect,
-    top: f64,
-    view: &SettingsView<'_>,
-    _focus: &mut Option<TextFocus>,
-    peak: f32,
-) -> (f64, Rect) {
-    let w = view.workspace;
-    let prefs = view.preferences;
-    heading(
-        p,
-        bounds,
-        top,
-        "Measure speakers",
-        "Background noise, then left and right full-range sweeps. Keep the mic still.",
-        None,
-    );
-    let inner = Rect::new(bounds.x0, top + 56.0, bounds.x1, bounds.y1);
-    let mut f = Form::new(inner, top + 56.0, !w.running);
-    draw_recovery(p, &mut f, w);
-    if w.running || matches!(w.progress, Some(Progress::Failed(_))) {
-        draw_run_banner(
-            p,
-            Rect::new(inner.x0, f.y, inner.x1, f.y + 76.0),
-            w,
-            prefs,
-            &room_status(w, prefs),
-        );
-        f.y += 88.0;
-    }
-    f.section(p, "Optional speaker level checks", Icon::Waveform);
-    let end = p
-        .button(
-            inner.x0,
-            f.y,
-            "Check left",
-            super::Action::Room(Action::CheckLevel(measurement::Speaker::Left)),
-            !w.running,
-        )
-        .x1;
-    p.button(
-        end + GAP,
-        f.y,
-        "Check right",
-        super::Action::Room(Action::CheckLevel(measurement::Speaker::Right)),
-        !w.running,
-    );
-    f.y += 32.0;
-    f.note(p,"Use these short tests to adjust speaker volume and microphone headroom if needed. You can start measurement directly.");
-    f.section(p, "Background noise", Icon::Waveform);
-    let noise = w.latest_noise.as_ref().or_else(|| {
+
+fn latest_noise(w: &Workspace) -> Option<&measurement::Noise> {
+    w.latest_noise.as_ref().or_else(|| {
         if w.running {
             return None;
         }
         w.source
             .as_ref()
             .map(|s| &s.points[s.plan.layout.reference].noise)
-    });
-    let graph = Rect::new(inner.x0 + 40.0, f.y + 12.0, inner.x1 - 20.0, f.y + 132.0);
-    draw_noise_graph(p, graph, noise);
-    f.y += 162.0;
-    if let Some(noise) = noise {
-        f.note(p, &format!("Input noise {:.1} dBFS RMS.", noise.rms_dbfs));
-        f.note(p, &format!(
-            "Noise-level variation {:.1} dB / warning {:.1} dB. Peak-to-average {:.1} dB / warning {:.1} dB.",
-            noise.window_variation_db, noise.limits.maximum_variation_db,
-            noise.crest_db, noise.limits.maximum_crest_db,
-        ));
-        if let Some(warning) = noise.quality_warning() {
-            f.note(p, &warning);
-        }
-        f.note(
-            p,
-            "Background sets uncertainty; it is not subtracted from the room response.",
-        );
-    } else {
-        f.note(
-    p,
-    "Background noise has not been recorded. Acquisition records it before the sweeps at each point.",
-);
-    }
-    draw_level_meter(p, Rect::new(inner.x0, f.y, inner.x1, f.y + 36.0), w, peak);
-    f.y += 44.0;
-    let active = w.progress.as_ref();
-    let baseline_captured = matches!(
-        active,
-        Some(Progress::Move {
-            movement: workflow::Movement::Reference(_),
-            ..
-        })
+    })
+}
+
+/// Listening area, placement diagram, capture progress and background noise. Returns the bottom edge.
+fn draw_positions(
+    p: &mut Painter<'_, super::Action>,
+    bounds: Rect,
+    view: &SettingsView<'_>,
+    focus: &mut Option<TextFocus>,
+) -> f64 {
+    let w = view.workspace;
+    let prefs = view.preferences;
+    let layout = &prefs.layout;
+    let mut f = Form::new(bounds, bounds.y0, !w.running);
+    let count = layout.positions.len();
+    f.section_with_badge(
+        p,
+        "Microphone positions",
+        Icon::Circle,
+        &if count == 1 {
+            "1 position".into()
+        } else {
+            format!("{count} positions")
+        },
+        Tone::Neutral,
     );
-    for (label, current, done) in [
-        (
-            "Background",
-            matches!(active, Some(Progress::Background { .. })),
-            noise.is_some(),
-        ),
-        (
-            "Left / full range",
-            matches!(
-                active,
-                Some(Progress::Sweep {
-                    speaker: measurement::Speaker::Left,
-                    ..
-                })
+    let area = if count > 1 {
+        Area::Listening
+    } else {
+        Area::Single
+    };
+    f.chips(
+        p,
+        [
+            (
+                "Single position",
+                Action::SetArea(Area::Single),
+                area == Area::Single,
             ),
-            baseline_captured
-                || (!w.running && w.source.is_some())
-                || matches!(
-                    active,
-                    Some(Progress::Sweep {
-                        speaker: measurement::Speaker::Right,
-                        ..
-                    })
-                ),
-        ),
-        (
-            "Right / full range",
-            matches!(
-                active,
-                Some(Progress::Sweep {
-                    speaker: measurement::Speaker::Right,
-                    ..
-                })
+            (
+                "Listening area",
+                Action::SetArea(Area::Listening),
+                area == Area::Listening,
             ),
-            baseline_captured || !w.running && w.source.is_some(),
-        ),
-    ] {
-        p.text(label, f.row(), Face::Label, Align::Start, p.colors.fg);
-        p.text(
-            if current {
-                "Recording..."
-            } else if done {
-                "Captured"
-            } else {
-                "Pending"
-            },
-            f.row(),
-            Face::SmallValue,
-            Align::End,
-            if done {
-                p.colors.basic[2]
-            } else {
-                p.colors.secondary
-            },
-        );
-        f.y += ROW;
-    }
-    if prefs.acquisition.lf_detail.is_some() {
-        f.note(
+        ]
+        .into_iter(),
+    );
+    let captures = Captures::new(w, layout, prefs.acquisition.lf_detail.is_some());
+    let diagram = Rect::new(bounds.x0, f.y, bounds.x1, f.y + 168.0);
+    draw_placement(p, diagram, layout, &captures, active_position(w));
+    f.y = diagram.y1 + GAP;
+    let prompt = match active_position(w) {
+        Some(position) if matches!(w.progress, Some(Progress::Move { .. })) => {
+            format!("Move the microphone: {}", layout.positions[position].name)
+        }
+        Some(position) => format!("Recording at {}. Keep the microphone still.", layout.positions[position].name),
+        None if area == Area::Single => {
+            "Microphone at ear height in your usual listening position.".into()
+        }
+        None => "Start at your usual head position, then follow the prompts to the nearby positions, keeping the microphone on a stand.".into(),
+    };
+    f.note(p, &prompt);
+    if area == Area::Listening {
+        f.toggle(
             p,
-            "Fine LF acquisition enabled / separate slow sweep and inverse.",
+            "Countdown between positions",
+            Action::HandsFree,
+            matches!(prefs.progression, workflow::Progression::HandsFree { .. }),
         );
+        if matches!(prefs.progression, workflow::Progression::HandsFree { .. }) {
+            f.number(p, view, Parameter::MoveSeconds, focus);
+        }
     }
-    f.section(p, "Microphone positions", Icon::Circle);
-    f.y += 232.0;
-    for &i in &prefs.layout.order {
+
+    f.y += GAP;
+    draw_capture_grid(p, &mut f, layout, &captures);
+
+    if let Some(noise) = latest_noise(w) {
+        let row = f.row();
         p.text(
-            &format!(
-                "{}  {}{}",
-                i + 1,
-                prefs.layout.positions[i].name,
-                if i == prefs.layout.reference {
-                    " / reference"
-                } else {
-                    ""
-                }
-            ),
-            f.row(),
+            &format!("Background {:.1} dBFS RMS", noise.rms_dbfs),
+            row,
             Face::Label,
             Align::Start,
             p.colors.fg,
         );
+        let warning = noise.quality_warning();
+        if warning.is_some() {
+            badge(p, row, "Varied", Tone::Warning);
+        } else {
+            badge(p, row, "Steady", Tone::Good);
+        }
         f.y += ROW;
+        if let Some(warning) = warning {
+            f.note(p, &warning);
+        }
     }
-    f.note(
-    p,
-    "Each position records background noise and both speakers. Follow the placement prompt between positions.",
-);
-    (f.y - top + INSET, Rect::ZERO)
+    f.y
 }
-fn draw_noise_graph(
+
+/// Top view of the speakers and microphone positions, laid out from their coordinates.
+fn draw_placement(
     p: &mut Painter<'_, super::Action>,
-    plot: Rect,
-    noise: Option<&measurement::Noise>,
+    bounds: Rect,
+    layout: &measurement::Layout,
+    captures: &Captures,
+    active: Option<usize>,
 ) {
+    let colors = p.colors;
+    p.rounded(bounds, RADIUS, colors.bg);
+    let speaker = |x: f64| Rect::from_center_size((x, bounds.y0 + 20.0), (22.0, 14.0));
+    for (label, x) in [
+        ("L", bounds.x0 + bounds.width() * 0.3),
+        ("R", bounds.x0 + bounds.width() * 0.7),
+    ] {
+        p.rounded(speaker(x), 2.0, colors.secondary);
+        p.text(
+            label,
+            Rect::from_center_size((x, bounds.y0 + 38.0), (24.0, 16.0)),
+            Face::Small,
+            Align::Center,
+            colors.secondary,
+        );
+    }
+    let coordinates: Vec<[f64; 3]> = layout
+        .positions
+        .iter()
+        .map(|p| p.coordinates_cm.unwrap_or([0.0; 3]))
+        .collect();
+    let extent = coordinates
+        .iter()
+        .flat_map(|c| [c[0].abs(), c[1].abs()])
+        .fold(10.0, f64::max);
+    let center = vello::kurbo::Point::new(bounds.center().x, bounds.y0 + 104.0);
+    let scale = 50.0 / extent;
+    for (position, c) in coordinates.iter().enumerate() {
+        // Forward is toward the speakers, so it points up the view.
+        let at = vello::kurbo::Point::new(center.x + c[0] * scale, center.y - c[1] * scale);
+        let dot = Rect::from_center_size(at, (22.0, 22.0));
+        let done = captures.position_done(position);
+        if active == Some(position) {
+            p.outline(dot.inflate(3.0, 3.0), 14.0, 2.0, colors.basic[4]);
+        }
+        if done {
+            p.rounded(dot, 11.0, colors.basic[2]);
+        } else {
+            p.outline(dot, 11.0, 1.5, colors.secondary);
+        }
+        p.text(
+            &(position + 1).to_string(),
+            dot,
+            Face::Small,
+            Align::Center,
+            if done { colors.bg } else { colors.fg },
+        );
+        if c[2] != 0.0 {
+            p.text(
+                &format!("{:+.0} cm", c[2]),
+                Rect::new(dot.x1 + 4.0, dot.y0, dot.x1 + 60.0, dot.y1),
+                Face::Small,
+                Align::Start,
+                colors.secondary,
+            );
+        }
+    }
+    p.text(
+        "Top view / listener faces the speakers",
+        Rect::new(
+            bounds.x0 + GAP,
+            bounds.y1 - 22.0,
+            bounds.x1 - GAP,
+            bounds.y1 - 4.0,
+        ),
+        Face::Small,
+        Align::Start,
+        colors.secondary,
+    );
+}
+
+fn draw_capture_grid(
+    p: &mut Painter<'_, super::Action>,
+    f: &mut Form,
+    layout: &measurement::Layout,
+    captures: &Captures,
+) {
+    use measurement::Speaker::{Left, Right};
+    let mut columns = vec![
+        ("Noise", Capture::Noise),
+        ("Left", Capture::Full(Left)),
+        ("Right", Capture::Full(Right)),
+    ];
+    if captures.lf {
+        columns.extend([
+            ("Bass L", Capture::Bass(Left)),
+            ("Bass R", Capture::Bass(Right)),
+        ]);
+    }
+    let bounds = f.bounds;
+    let cell = 64.0;
+    let first = bounds.x1 - cell * columns.len() as f64;
+    let cells = |p: &mut Painter<'_, super::Action>,
+                 y: f64,
+                 values: &mut dyn Iterator<Item = Option<CaptureState>>| {
+        for (i, state) in values.enumerate() {
+            let rect = Rect::new(
+                first + i as f64 * cell + 2.0,
+                y + 3.0,
+                first + (i + 1) as f64 * cell - 2.0,
+                y + CONTROL - 3.0,
+            );
+            let Some(state) = state else { continue };
+            let (label, tone) = match state {
+                CaptureState::Pending => ("--", Tone::Neutral),
+                CaptureState::Recording => ("Now", Tone::Warning),
+                CaptureState::Saved => ("Done", Tone::Good),
+            };
+            let ink = tone.color(p.colors);
+            if state != CaptureState::Pending {
+                p.rounded(rect, RADIUS, opacity(ink, 0.16));
+            }
+            p.text(label, rect, Face::Small, Align::Center, ink);
+        }
+    };
+    for (i, (label, _)) in columns.iter().enumerate() {
+        p.text(
+            label,
+            Rect::new(
+                first + i as f64 * cell,
+                f.y,
+                first + (i + 1) as f64 * cell,
+                f.y + CONTROL,
+            ),
+            Face::Small,
+            Align::Center,
+            p.colors.secondary,
+        );
+    }
+    f.y += CONTROL;
+    let row = |p: &mut Painter<'_, super::Action>,
+               f: &mut Form,
+               name: String,
+               values: &mut dyn Iterator<Item = Option<CaptureState>>| {
+        p.line((bounds.x0, f.y), (bounds.x1, f.y), p.colors.pane(), 1.0);
+        p.text(
+            &name,
+            Rect::new(bounds.x0, f.y, first - GAP, f.y + CONTROL),
+            Face::Label,
+            Align::Start,
+            p.colors.fg,
+        );
+        cells(p, f.y, values);
+        f.y += CONTROL + 4.0;
+    };
+    for &position in &layout.order {
+        row(
+            p,
+            f,
+            format!("{}  {}", position + 1, layout.positions[position].name),
+            &mut columns.iter().map(|&(_, c)| captures.state(position, c)),
+        );
+        if position == layout.reference {
+            row(
+                p,
+                f,
+                "    Repeat for consistency".into(),
+                &mut columns.iter().map(|&(_, c)| match c {
+                    Capture::Full(s) => captures.state(position, Capture::Repeat(s)),
+                    _ => None,
+                }),
+            );
+        }
+    }
+    f.y += GAP;
+}
+
+fn draw_noise_graph(p: &mut Painter<'_, super::Action>, plot: Rect, noise: &measurement::Noise) {
     p.rect(plot, p.colors.bg);
-    let (low, high) = noise.map_or((-160.0, -60.0), |n| {
-        let maximum = n
+    let (low, high) = {
+        let maximum = noise
             .psd_dbfs_per_hz
             .db
             .iter()
             .copied()
             .fold(f32::NEG_INFINITY, f32::max);
-        let minimum = n
+        let minimum = noise
             .psd_dbfs_per_hz
             .db
             .iter()
@@ -4012,7 +4370,7 @@ fn draw_noise_graph(
             .fold(f32::INFINITY, f32::min);
         let high = (maximum / 20.0).ceil() * 20.0 + 20.0;
         ((high - 80.0).min((minimum / 20.0).floor() * 20.0), high)
-    });
+    };
     for db in [low, (low + high) / 2.0, high] {
         let y = plot.y0 + f64::from((high - db) / (high - low)) * plot.height();
         p.line((plot.x0, y), (plot.x1, y), p.colors.ghost, 1.0);
@@ -4024,26 +4382,16 @@ fn draw_noise_graph(
             p.colors.secondary,
         );
     }
-    if let Some(noise) = noise {
-        let curve = Curve {
-            frequency: noise.psd_dbfs_per_hz.frequency.clone(),
-            db: noise
-                .psd_dbfs_per_hz
-                .db
-                .iter()
-                .map(|d| 48.0 * (*d - low) / (high - low) - 24.0)
-                .collect(),
-        };
-        p.curve(&curve, plot, p.colors.secondary, 1.5);
-    } else {
-        p.text(
-            "No background recording",
-            plot,
-            Face::Small,
-            Align::Center,
-            p.colors.secondary,
-        );
-    }
+    let curve = Curve {
+        frequency: noise.psd_dbfs_per_hz.frequency.clone(),
+        db: noise
+            .psd_dbfs_per_hz
+            .db
+            .iter()
+            .map(|d| 48.0 * (*d - low) / (high - low) - 24.0)
+            .collect(),
+    };
+    p.curve(&curve, plot, p.colors.secondary, 1.5);
     p.text(
         "20 Hz",
         Rect::new(plot.x0, plot.y1 + 4.0, plot.x0 + 80.0, plot.y1 + 24.0),
@@ -4082,7 +4430,7 @@ fn draw_settings(
     p,
     "Saved measurements retain microphone recordings and calibration. Reopen one to adjust the correction without measuring again.",
 );
-            f.button(p, "New measurement", Action::Stage(Stage::Setup));
+            f.button(p, "New measurement", Action::Stage(Stage::Measure));
             for (&id, name) in view.measurements {
                 p.list_row(
                     Rect::new(bounds.x0, f.y, bounds.x1, f.y + 48.0),
@@ -4139,6 +4487,26 @@ fn draw_settings(
     f.y - top + 8.0
 }
 
+fn estimate_label(estimate: &workflow::Estimate) -> String {
+    let duration = |d: std::time::Duration| {
+        let seconds = d.as_secs_f64().round() as u64;
+        match (seconds / 60, seconds % 60) {
+            (0, s) => format!("{s} s"),
+            (m, 0) => format!("{m} min"),
+            (m, s) => format!("{m} min {s} s"),
+        }
+    };
+    let mut text = format!("About {} of recording", duration(estimate.acquisition));
+    match (estimate.moves, estimate.movement) {
+        (0, _) => {}
+        (moves, Some(movement)) => {
+            text += &format!(" and {moves} timed moves ({})", duration(movement))
+        }
+        (1, None) => text += " and 1 microphone move",
+        (moves, None) => text += &format!(" and {moves} microphone moves"),
+    }
+    text + ". Place the microphone at the reference position."
+}
 fn stop_label(reason: workflow::StopReason) -> &'static str {
     match reason {
         workflow::StopReason::Prepared => "Candidate prepared / verification needed",
@@ -4855,10 +5223,12 @@ fn draw_run_banner(
                 "A short reference signal plays from the selected speaker."
             } else if matches!(w.progress, Some(Progress::Failed(_))) {
                 "Adjust setup and try again."
+            } else if w.active_plan.as_ref().is_some_and(|plan| plan.kind.acquires()) {
+                "Background noise, then left and right sweeps at each position. Keep the microphone still."
             } else if prefs.layout.positions.len() > 1 {
                 "The reference check measures this listening position. Other positions remain predicted."
             } else {
-                "Stationary reference / mandatory full-range final verification"
+                "Measuring the playing correction at the reference position."
             },
             Rect::new(
                 bounds.x0 + 12.0,
@@ -4879,6 +5249,7 @@ fn draw_workspace_actions(
     prefs: &measurement::Preferences,
     preparing: bool,
     listening: bool,
+    estimate: &workflow::Estimate,
 ) {
     let y = bounds.y1 - INSET - CONTROL;
     p.rect(
@@ -4895,17 +5266,11 @@ fn draw_workspace_actions(
         ("Stop", Action::Stop, true, room_status(w, prefs))
     } else {
         match w.stage {
-            Stage::Setup => (
-                "Continue to measurement",
-                Action::Stage(Stage::Measure),
-                true,
-                "Keep speaker volume and microphone gain fixed".into(),
-            ),
             Stage::Measure => (
                 "Measure speakers",
                 Action::Measure,
                 true,
-                "Place the microphone at the reference position".into(),
+                estimate_label(estimate),
             ),
             Stage::Correction => (
                 if listening { "Listening" } else { "Listen" },
@@ -5897,7 +6262,7 @@ mod tests {
     #[test]
     fn minimum_window_retains_route_and_scrollable_workspace() {
         let (_directory, mut app) = workspace();
-        for stage in [Stage::Setup, Stage::Measure, Stage::Correction] {
+        for stage in [Stage::Measure, Stage::Correction] {
             app.room_action(Action::Stage(stage)).unwrap();
             app.build_scene(Size::new(880.0, 760.0), 1.0);
             assert_eq!(
@@ -5909,7 +6274,6 @@ mod tests {
                 }
             );
             let primary = match stage {
-                Stage::Setup => Action::Stage(Stage::Measure),
                 Stage::Measure => Action::Measure,
                 Stage::Correction => Action::Listen,
             };
@@ -5997,7 +6361,7 @@ mod tests {
     #[test]
     fn playback_selectors_follow_existing_stream_ownership_while_the_mic_stays_separate() {
         let (_directory, mut app) = workspace();
-        app.room.stage = Stage::Setup;
+        app.room.stage = Stage::Measure;
         let size = Size::new(880.0, 760.0);
         app.lifecycle = Lifecycle::Running {
             rate: Rate::Hz48000,

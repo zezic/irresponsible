@@ -117,18 +117,6 @@ impl RoomLayout {
             Rect::new(bounds.x1 - half, bounds.y0, bounds.x1, bounds.y1),
         ]
     }
-    pub fn route_columns(&self) -> [Rect; 2] {
-        let y = self.body.y0 + 2.0 * ROW;
-        Self::columns(Rect::new(self.body.x0, y, self.body.x1, y + CONTROL))
-    }
-    pub fn after_route(&self) -> Rect {
-        Rect::new(
-            self.body.x0,
-            self.route_columns()[0].y1 + INSET,
-            self.body.x1,
-            self.body.y1,
-        )
-    }
 }
 
 /// Drawing and input share geometry in points. Native window chrome is

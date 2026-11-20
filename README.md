@@ -31,9 +31,9 @@ Closing the window keeps normal listening running. During room acquisition, clos
 
 ## Room correction
 
-Open **Room** beside Headphones. In **Setup**, select the speaker output and a separate physical microphone input. Load the microphone's calibration file with the matching orientation. Keep hardware direct monitoring and voice processing disabled. Optional left/right checks help identify speakers and set recording headroom.
+Open **Room** beside Headphones. In **Measure**, select the speaker output and a separate physical microphone input. Load the microphone's calibration file with the matching orientation. Keep hardware direct monitoring and voice processing disabled. Optional left/right checks help identify speakers and set recording headroom.
 
-Choose a single listening position or the guided five-position listening area. **Measure speakers** records background noise and sequential L/R sweeps, then creates one correction. Keep speaker volume and microphone gain fixed. Multi-position measurements prompt you to move the microphone; a countdown is optional.
+Choose a single listening position or the guided five-position listening area; the top view shows where each position is and the grid beside it tracks every capture. **Measure speakers** records background noise and sequential L/R sweeps, then creates one correction. Keep speaker volume and microphone gain fixed. Multi-position measurements prompt you to move the microphone; a countdown is optional.
 
 In **Correction**, pick a target (or **Custom** to shape tilt, bass shelf and mid bell), adjust smoothing and effort on the graph or in the settings column, then press **Listen**; further edits play as soon as they are prepared. **Bypass** compares with the original. Boost and cut limiters are off by default; enable them independently for up to +24 dB boost or 36 dB attenuation. FIR length is selected automatically.
 

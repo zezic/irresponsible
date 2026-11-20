@@ -580,7 +580,7 @@ pub fn run_simulated() -> Result<()> {
 #[derive(Default)]
 pub enum PreviewState {
     Room,
-    RoomSetup,
+    RoomMeasure,
     RoomVerification,
     RoomFilter,
     #[default]
@@ -609,7 +609,7 @@ impl std::str::FromStr for PreviewState {
     fn from_str(value: &str) -> Result<Self> {
         match value {
             "room" => Ok(Self::Room),
-            "room-setup" => Ok(Self::RoomSetup),
+            "room-measure" => Ok(Self::RoomMeasure),
             "room-verify" => Ok(Self::RoomVerification),
             "room-filter" => Ok(Self::RoomFilter),
             "comparison" => Ok(Self::Comparison),
@@ -648,7 +648,7 @@ pub fn render_preview(
     if matches!(
         state,
         PreviewState::Room
-            | PreviewState::RoomSetup
+            | PreviewState::RoomMeasure
             | PreviewState::RoomVerification
             | PreviewState::RoomFilter
     ) {
@@ -733,7 +733,7 @@ pub fn render_preview(
     }
     match state {
         PreviewState::Room
-        | PreviewState::RoomSetup
+        | PreviewState::RoomMeasure
         | PreviewState::RoomVerification
         | PreviewState::RoomFilter => {
             unreachable!("room preview handled separately")
