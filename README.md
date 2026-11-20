@@ -18,7 +18,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/zezic/ir
 
 The installer downloads the latest release for your Mac, verifies its checksum and app signature, installs to `~/Applications`, and removes quarantine. Builds are ad-hoc signed and are not notarized yet. To choose a different folder, append `-s -- --directory /Applications` after `bash`.
 
-You can also download the **arm64** (Apple Silicon) or **x86_64** (Intel) archive from [Releases](https://github.com/zezic/irresponsible/releases).
+You can also download the **arm64** (Apple Silicon) archive from [Releases](https://github.com/zezic/irresponsible/releases).
 
 ## First listen
 

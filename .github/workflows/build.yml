@@ -51,10 +51,6 @@ jobs:
             runner: macos-15
             target: aarch64-apple-darwin
             arch: arm64
-          - name: Intel
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            arch: x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -66,7 +62,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust
       - name: Test
-        run: cargo test --locked --all-features
+        run: cargo test --release --locked --all-features
       - name: Package app
         run: bash scripts/package.sh --target "$CARGO_BUILD_TARGET" --archive
       - name: Test installer against the built archive
@@ -99,7 +95,7 @@ jobs:
           pattern: macos-*
           merge-multiple: true
           path: dist
-      - name: Publish both archives and checksums
+      - name: Publish archive and checksums
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

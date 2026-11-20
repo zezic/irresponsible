@@ -216,16 +216,15 @@ pub struct SpeakerAlignment {
 }
 impl SpeakerAlignment {
     pub fn validate(self) -> Result<()> {
-        if self
-            .trim_db
-            .iter()
-            .any(|v| !v.is_finite() || !(-6.0..=0.0).contains(v))
+        if self.trim_db.iter().any(|v| !v.is_finite() || *v > 0.0)
             || self
                 .delay_seconds
                 .iter()
-                .any(|v| !v.is_finite() || !(0.0..=0.005).contains(v))
+                .any(|v| !v.is_finite() || *v < 0.0)
         {
-            return Err(invalid("Speaker alignment exceeds 6 dB trim or 5 ms delay"));
+            return Err(invalid(
+                "Speaker alignment must be finite trim cuts and nonnegative delays",
+            ));
         }
         Ok(())
     }
@@ -681,7 +680,6 @@ impl Frozen {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Realization {
     pub common_gain_db: f64,
-    pub design_scale: f64,
     pub peak_gain_db: [f64; 2],
     pub tail_energy_ratio: [f64; 2],
     pub headroom_db: f64,
@@ -689,18 +687,15 @@ pub struct Realization {
 }
 impl Realization {
     pub fn validate(&self) -> Result<()> {
-        if !self.common_gain_db.is_finite()
-            || self.common_gain_db.abs() > 0.15
-            || !(0.95..=1.0).contains(&self.design_scale)
-            || !self.headroom_db.is_finite()
-            || self.headroom_db > -0.999
-            || self.peak_gain_db.iter().any(|v| !v.is_finite())
-            || self
-                .tail_energy_ratio
-                .iter()
-                .any(|v| !v.is_finite() || !(0.0..=0.001).contains(v))
-            || !self.maximum_design_error_db.is_finite()
-            || !(0.0..=0.8).contains(&self.maximum_design_error_db)
+        if [
+            self.common_gain_db,
+            self.headroom_db,
+            self.maximum_design_error_db,
+        ]
+        .iter()
+        .chain(&self.peak_gain_db)
+        .chain(&self.tail_energy_ratio)
+        .any(|v| !v.is_finite())
         {
             return Err(invalid("Invalid realized room filter evidence"));
         }
@@ -763,7 +758,8 @@ fn project(value: f64, i: usize, c: usize, frozen: &Frozen) -> f32 {
     let edge = lower.min(upper).clamp(0.0, 1.0);
     let mut value = value;
     if let Some(limit) = frozen.recipe.maximum_cut_db {
-        value = value.max(-limit + 0.08_f64.min(limit) - frozen.alignment.trim_db[c]);
+        // Trim beyond the cut allowance leaves no room to cut, but never forces a boost.
+        value = value.max((-limit + 0.08_f64.min(limit) - frozen.alignment.trim_db[c]).min(0.0));
     }
     if let Some(limit) = frozen.recipe.maximum_boost_db {
         value = value.min((limit - 0.08).max(0.0) - frozen.alignment.trim_db[c]);
@@ -842,7 +838,11 @@ fn level_alignment(response: [&Response; 2]) -> Result<[f64; 2]> {
     Ok([-difference.max(0.0), difference.min(0.0)])
 }
 
-/// Select the shortest supported FIR that satisfies the realized response checks.
+/// Short FIRs within this design error and tail energy are preferred over long ones.
+const SHORT_FIR_MAX_ERROR_DB: f64 = 0.8;
+const SHORT_FIR_MAX_TAIL_ENERGY: f64 = 0.001;
+
+/// Select the short FIR when it realizes the design closely, otherwise the long one.
 pub fn freeze_at_rate(
     source: &Source,
     id: ContentHash,
@@ -852,15 +852,18 @@ pub fn freeze_at_rate(
     source.validate()?;
     recipe.validate()?;
     recipe.taps = Taps::Short;
-    if let Ok(frozen) = freeze_design(source, id, recipe.clone(), rate)
-        && realize(&frozen, &frozen.designed_db, rate).is_ok()
+    let short = freeze_design(source, id, recipe.clone(), rate)?;
+    let (_, realized) = realize(&short, &short.designed_db, rate)?;
+    if realized.maximum_design_error_db <= SHORT_FIR_MAX_ERROR_DB
+        && realized
+            .tail_energy_ratio
+            .iter()
+            .all(|&r| r <= SHORT_FIR_MAX_TAIL_ENERGY)
     {
-        return Ok(frozen);
+        return Ok(short);
     }
     recipe.taps = Taps::Long;
-    let frozen = freeze_design(source, id, recipe, rate)?;
-    realize(&frozen, &frozen.designed_db, rate)?;
-    Ok(frozen)
+    freeze_design(source, id, recipe, rate)
 }
 
 fn freeze_design(source: &Source, id: ContentHash, recipe: Recipe, rate: Rate) -> Result<Frozen> {
@@ -880,12 +883,6 @@ fn freeze_design(source: &Source, id: ContentHash, recipe: Recipe, rate: Rate) -
         alignment.delay_seconds = arrival.map(|s| late - s);
     }
     alignment.validate()?;
-    if recipe
-        .maximum_cut_db
-        .is_some_and(|limit| alignment.trim_db.iter().any(|v| *v < -limit))
-    {
-        return Err(invalid("Speaker trim exceeds total cut allowance"));
-    }
     for (c, trim) in alignment.trim_db.iter().enumerate() {
         baseline.magnitude[c]
             .db
@@ -989,22 +986,15 @@ fn freeze_design(source: &Source, id: ContentHash, recipe: Recipe, rate: Rate) -
     Ok(frozen)
 }
 
+/// Among the best designed candidates, pick the offset whose realized FIR fits best.
 fn fit_realized_offset(
     frozen: &Frozen,
     candidates: impl IntoIterator<Item = (f64, [Vec<f32>; 2])>,
     rate: Rate,
 ) -> Result<f64> {
     let mut best = None;
-    let mut feasible = 0;
-    let mut first_error = None;
-    for (offset, design) in candidates {
-        let (channels, _) = match realize(frozen, &design, rate) {
-            Ok(realized) => realized,
-            Err(error) => {
-                first_error.get_or_insert(error);
-                continue;
-            }
-        };
+    for (offset, design) in candidates.into_iter().take(3) {
+        let (channels, _) = realize(frozen, &design, rate)?;
         let actual = std::array::from_fn(|c| {
             analysis::magnitude(&channels[c], rate, &frozen.target.frequency)
                 .into_iter()
@@ -1015,13 +1005,10 @@ fn fit_realized_offset(
         if best.is_none_or(|(previous, _)| cost < previous) {
             best = Some((cost, offset));
         }
-        feasible += 1;
-        if feasible == 3 {
-            break;
-        }
     }
-    best.map(|(_, offset)| offset)
-        .ok_or_else(|| first_error.expect("target-level fitting always supplies candidate offsets"))
+    Ok(best
+        .expect("target-level fitting always supplies candidate offsets")
+        .1)
 }
 
 /// Real-cepstrum minimum phase with unity endpoints; no headphone normalization.
@@ -1095,65 +1082,40 @@ fn aligned_channels(frozen: &Frozen, design: &[Vec<f32>; 2], rate: Rate) -> [Vec
     })
 }
 
-struct ProjectedFir {
-    channels: [Vec<f32>; 2],
-    common_gain_db: f64,
-    design_scale: f64,
-}
+/// Aligned channels with one common gain that fits the joint boost/cut limits where possible.
 fn project_realization(
     frozen: &Frozen,
     design: &[Vec<f32>; 2],
     rate: Rate,
-) -> Result<ProjectedFir> {
-    for step in 0..=10 {
-        let design_scale = 1.0 - f64::from(step) * 0.005;
-        let bounded = design
-            .each_ref()
-            .map(|d| d.iter().map(|v| *v * design_scale as f32).collect());
-        let mut channels = aligned_channels(frozen, &bounded, rate);
-        let extrema = channels.each_ref().map(|h| {
-            let bins = analysis::fft(h, frozen.recipe.taps.frames() * 8);
-            let high = bins.iter().map(|v| v.norm()).fold(0.0, f64::max);
-            let low = bins.iter().map(|v| v.norm()).fold(f64::INFINITY, f64::min);
-            [20.0 * low.max(1e-20).log10(), 20.0 * high.log10()]
-        });
-        let low = extrema.iter().map(|e| e[0]).fold(f64::INFINITY, f64::min);
-        let high = extrema
-            .iter()
-            .map(|e| e[1])
-            .fold(f64::NEG_INFINITY, f64::max);
-        let lower = frozen
-            .recipe
-            .maximum_cut_db
-            .map_or(f64::NEG_INFINITY, |limit| -limit - low);
-        let upper = frozen
-            .recipe
-            .maximum_boost_db
-            .map_or(f64::INFINITY, |limit| limit - high);
-        let common_gain_db = if lower > 0.00001 || upper < -0.00001 {
-            if lower + 0.002 > upper {
-                continue;
-            }
-            0.0f64.clamp(lower + 0.001, upper - 0.001)
-        } else {
-            0.0
-        };
-        if common_gain_db.abs() > 0.15 {
-            continue;
+) -> ([Vec<f32>; 2], f64) {
+    let mut channels = aligned_channels(frozen, design, rate);
+    let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+    for h in &channels {
+        for v in analysis::fft(h, frozen.recipe.taps.frames() * 8) {
+            let db = 20.0 * v.norm().max(1e-20).log10();
+            low = low.min(db);
+            high = high.max(db);
         }
-        let common_gain = 10f64.powf(common_gain_db / 20.0) as f32;
-        for channel in &mut channels {
-            channel.iter_mut().for_each(|v| *v *= common_gain);
-        }
-        return Ok(ProjectedFir {
-            channels,
-            common_gain_db,
-            design_scale,
-        });
     }
-    Err(invalid(
-        "FIR cannot meet the joint stereo gain limits within 5% design projection; increase smoothing or FIR length",
-    ))
+    let lower = frozen
+        .recipe
+        .maximum_cut_db
+        .map_or(f64::NEG_INFINITY, |limit| -limit - low);
+    let upper = frozen
+        .recipe
+        .maximum_boost_db
+        .map_or(f64::INFINITY, |limit| limit - high);
+    let common_gain_db = if lower <= upper {
+        0.0f64.clamp(lower, upper)
+    } else {
+        // Ripple wider than the allowed span: split the overshoot evenly.
+        (lower + upper) / 2.0
+    };
+    let common_gain = 10f64.powf(common_gain_db / 20.0) as f32;
+    for channel in &mut channels {
+        channel.iter_mut().for_each(|v| *v *= common_gain);
+    }
+    (channels, common_gain_db)
 }
 
 fn realize(
@@ -1172,59 +1134,28 @@ fn realize(
     {
         return Err(invalid("Invalid total correction design"));
     }
-    let ProjectedFir {
-        channels,
-        common_gain_db,
-        design_scale,
-    } = project_realization(frozen, design, rate)?;
+    let (channels, common_gain_db) = project_realization(frozen, design, rate);
     let mut peak_gain_db = [0.0; 2];
     let mut tail_energy_ratio = [0.0; 2];
     let mut error = 0.0f64;
-    let mut error_hz = 0.0;
     for c in 0..2 {
         let bins = analysis::fft(&channels[c], frozen.recipe.taps.frames() * 8);
-        let max = bins.iter().map(|b| b.norm()).fold(0.0, f64::max);
-        let min = bins.iter().map(|b| b.norm()).fold(f64::INFINITY, f64::min);
-        peak_gain_db[c] = 20.0 * max.log10();
-        if frozen
-            .recipe
-            .maximum_boost_db
-            .is_some_and(|limit| peak_gain_db[c] > limit + 0.0001)
-            || frozen
-                .recipe
-                .maximum_cut_db
-                .is_some_and(|limit| 20.0 * min.max(1e-20).log10() < -limit - 0.0001)
-        {
-            return Err(invalid("Realized FIR violates cumulative boost/cut limits"));
-        }
+        peak_gain_db[c] = 20.0 * bins.iter().map(|b| b.norm()).fold(0.0, f64::max).log10();
         let energy: f64 = channels[c].iter().map(|&x| f64::from(x).powi(2)).sum();
         tail_energy_ratio[c] = channels[c][channels[c].len() * 7 / 8..]
             .iter()
             .map(|&x| f64::from(x).powi(2))
             .sum::<f64>()
             / energy.max(1e-24);
-        if tail_energy_ratio[c] > 0.001 {
-            return Err(invalid(
-                "FIR tail is not settled; use a longer filter or smoother correction",
-            ));
-        }
         let actual = analysis::magnitude(&channels[c], rate, f);
-        for ((&a, &d), &hz) in actual.iter().zip(&design[c]).zip(f) {
-            if (f64::from(a - d) - frozen.alignment.trim_db[c] - common_gain_db).abs() > error {
-                error = (f64::from(a - d) - frozen.alignment.trim_db[c] - common_gain_db).abs();
-                error_hz = hz;
-            }
+        for (&a, &d) in actual.iter().zip(&design[c]) {
+            error =
+                error.max((f64::from(a - d) - frozen.alignment.trim_db[c] - common_gain_db).abs());
         }
-    }
-    if error > 0.8 {
-        return Err(invalid(format!(
-            "Truncated FIR differs from design by {error:.2} dB at {error_hz:.1} Hz; increase smoothing"
-        )));
     }
     let headroom_db = -peak_gain_db.iter().copied().fold(0.0, f64::max) - 1.0;
     let realization = Realization {
         common_gain_db,
-        design_scale,
         peak_gain_db,
         tail_energy_ratio,
         headroom_db,
@@ -1396,7 +1327,6 @@ mod realization_tests {
         let actual = analysis::magnitude(&channels[1], frozen.rate, &frozen.target.frequency);
         assert!(actual.iter().any(|&db| db < -41.0));
         assert_eq!(realized.common_gain_db, 0.0);
-        assert_eq!(realized.design_scale, 1.0);
     }
 
     #[test]
@@ -1503,35 +1433,6 @@ mod realization_tests {
         let designed = design(&frozen, &smoothed_baseline(&frozen), 0.0);
         assert!((designed[0][i] + 2.0).abs() < 1e-5);
         assert!(designed[0][i - 1].abs() < 1e-5);
-    }
-
-    #[test]
-    fn target_level_search_skips_unrealizable_candidates_and_checks_the_final_fir() {
-        let frozen = objective();
-        let n = frozen.target.frequency.len();
-        let excessive = [vec![30.0; n], vec![30.0; n]];
-        let mut unresolved = frozen.designed_db.clone();
-        let i = frozen
-            .target
-            .frequency
-            .iter()
-            .position(|&f| f > 40.0)
-            .unwrap();
-        unresolved[0][i] = -12.0;
-        assert!(realize(&frozen, &excessive, frozen.rate).is_err());
-        assert!(realize(&frozen, &unresolved, frozen.rate).is_err());
-        let offset = fit_realized_offset(
-            &frozen,
-            [
-                (2.0, excessive.clone()),
-                (1.0, unresolved),
-                (0.0, frozen.designed_db.clone()),
-            ],
-            frozen.rate,
-        )
-        .unwrap();
-        assert_eq!(offset, 0.0);
-        assert!(fit_realized_offset(&frozen, [(2.0, excessive)], frozen.rate).is_err());
     }
 
     #[test]

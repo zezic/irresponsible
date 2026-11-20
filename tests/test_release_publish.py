@@ -18,9 +18,8 @@ class ReleasePublishTests(unittest.TestCase):
             (root / "dist").mkdir()
             (root / "bin").mkdir()
             shutil.copyfile(SCRIPT, root / "scripts/publish-release.sh")
-            for arch in ("arm64", "x86_64"):
-                if not missing_asset or arch == "arm64":
-                    (root / f"dist/IRresponsible-0.1.0-macos-{arch}.zip").write_bytes(b"archive fixture")
+            if not missing_asset:
+                (root / "dist/IRresponsible-0.1.0-macos-arm64.zip").write_bytes(b"archive fixture")
             gh = root / "bin/gh"
             gh.write_text('''#!/usr/bin/env python3
 import json, os, sys
