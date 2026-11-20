@@ -109,7 +109,7 @@ fn scenario_run(
             ..Scenario::default()
         },
     );
-    plan.recipe.global_effort = effort;
+    plan.recipe.effort = room::Effort::easy(effort);
     let (_tx, rx) = mpsc::sync_channel(8);
     let run = Run {
         plan,
@@ -188,7 +188,7 @@ fn room_pipeline_generates_and_measures_exact_stereo_filter() {
         panic!("room source");
     };
     let frozen: room::Frozen = serde_json::from_slice(&store.get(&objective).unwrap()).unwrap();
-    assert_eq!(frozen.recipe.global_effort, 0.5);
+    assert_eq!(frozen.recipe.effort, room::Effort::easy(0.5));
     let measured = &trial.measured[0];
     for (c, take) in measured.iter().enumerate() {
         let predicted = filter.channels[c].clone();
@@ -212,26 +212,6 @@ fn room_pipeline_generates_and_measures_exact_stereo_filter() {
             "verification must retain filter effect"
         );
     }
-}
-
-#[test]
-fn region_overrides_can_be_partial_removed_and_resized() {
-    let mut recipe = Recipe::default();
-    recipe
-        .insert_region(room::Region {
-            band: measurement::Band::new(100.0, 300.0).unwrap(),
-            effort: 0.5,
-            smoothing_octaves: 0.0,
-            lower_fade: 0.1,
-            upper_fade: 0.2,
-        })
-        .unwrap();
-    assert_eq!(recipe.profile(1000.0).0, 1.0);
-    assert_eq!(recipe.profile(180.0).0, 0.5);
-    recipe.resize_region(0, true, 120.0);
-    recipe.validate().unwrap();
-    recipe.regions.clear();
-    assert_eq!(recipe.profile(180.0).0, 1.0);
 }
 
 #[test]
@@ -318,7 +298,7 @@ fn offline_regeneration_keeps_history_preference_and_verification_identity() {
     let id = session.prefer(preferred, &store).unwrap();
     let recipe = Recipe {
         target: Target::Warm,
-        global_effort: 0.25,
+        effort: room::Effort::easy(0.25),
         taps: Taps::Short,
         ..Recipe::default()
     };
@@ -844,7 +824,7 @@ fn zero_tonal_effort_keeps_requested_alignment_and_cut_only_filters_stay_bounded
     let directory = tempfile::tempdir().unwrap();
     let store = Store::at(directory.path()).unwrap();
     let (mut plan, provider) = setup(&store, Scenario::default());
-    plan.recipe.global_effort = 0.0;
+    plan.recipe.effort = room::Effort::easy(0.0);
     plan.recipe.alignment = room::Alignment::Time;
     let (_tx, rx) = mpsc::sync_channel(8);
     let id = Run {
@@ -1245,7 +1225,7 @@ fn changed_ambient_level_uses_current_uncertainty_and_retains_measurements() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path()).unwrap();
         let (mut plan, provider) = setup(&store, Scenario::default());
-        plan.recipe.global_effort = 0.5;
+        plan.recipe.effort = room::Effort::easy(0.5);
         let (_tx, controls) = mpsc::sync_channel(8);
         let id = Run {
             plan,
@@ -1311,7 +1291,7 @@ fn saved_source_verification_retains_changed_acoustic_level() {
             source: source.plan.clone(),
             recipe: Recipe {
                 target: Target::Flat,
-                global_effort: 0.5,
+                effort: room::Effort::easy(0.5),
                 taps: Taps::Short,
                 ..Recipe::default()
             },
@@ -1380,7 +1360,7 @@ fn narrower_reverification_preserves_verified_best_and_records_partial_evidence(
             source: acquisition,
             recipe: Recipe {
                 target: Target::Flat,
-                global_effort: 0.5,
+                effort: room::Effort::easy(0.5),
                 taps: Taps::Short,
                 ..Recipe::default()
             },

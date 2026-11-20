@@ -9,6 +9,8 @@ use crate::{
     },
     storage::ContentHash,
 };
+mod fallback;
+
 use rustfft::{FftPlanner, num_complex::Complex64};
 use serde::{Deserialize, Serialize};
 
@@ -147,58 +149,210 @@ pub enum TargetLevel {
     Automatic,
     Fixed(f64),
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Region {
-    pub band: Band,
+/// One knot of an advanced effort line.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EffortPoint {
+    pub hz: f64,
+    /// Fraction of the target difference corrected at `hz`, 0-1.
     pub effort: f64,
-    pub smoothing_octaves: f64,
-    pub lower_fade: f64,
-    pub upper_fade: f64,
 }
-impl Region {
-    pub fn validate(&self) -> Result<()> {
-        Band::new(self.band.low, self.band.high)?;
-        if !(0.0..=1.0).contains(&self.effort)
-            || !(0.0..=2.0).contains(&self.smoothing_octaves)
-            || !self.lower_fade.is_finite()
-            || !self.upper_fade.is_finite()
-            || self.lower_fade < 0.0
-            || self.upper_fade < 0.0
-            || self.lower_fade + self.upper_fade > self.band.octaves() + 1e-9
+
+/// Correction strength across frequency. Effort is zero outside the correction range.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Effort {
+    /// One level across the range, faded linearly in log frequency from each range edge.
+    Easy {
+        level: f64,
+        low_fade_octaves: f64,
+        high_fade_octaves: f64,
+    },
+    /// Free line, linear in log frequency between knots and flat beyond the outer knots.
+    Advanced(Vec<EffortPoint>),
+}
+impl Default for Effort {
+    fn default() -> Self {
+        Self::easy(1.0)
+    }
+}
+impl Effort {
+    pub const MAX_POINTS: usize = 128;
+
+    /// Easy effort at `level` with the default 1/6 octave range-edge fades.
+    pub fn easy(level: f64) -> Self {
+        Self::Easy {
+            level,
+            low_fade_octaves: 1.0 / 6.0,
+            high_fade_octaves: 1.0 / 6.0,
+        }
+    }
+
+    fn validate(&self, range: Band) -> Result<()> {
+        let unit = |v: f64| (0.0..=1.0).contains(&v);
+        match self {
+            Self::Easy {
+                level,
+                low_fade_octaves,
+                high_fade_octaves,
+            } => {
+                if !unit(*level)
+                    || !(*low_fade_octaves >= 0.0 && *high_fade_octaves >= 0.0)
+                    || low_fade_octaves + high_fade_octaves > range.octaves() + 1e-9
+                {
+                    return Err(invalid(
+                        "Effort must be 0-1 with fades that fit the correction range",
+                    ));
+                }
+            }
+            Self::Advanced(points) => {
+                if !(2..=Self::MAX_POINTS).contains(&points.len())
+                    || points
+                        .iter()
+                        .any(|p| !unit(p.effort) || !(20.0..=20000.0).contains(&p.hz))
+                    || points.windows(2).any(|w| w[0].hz >= w[1].hz)
+                {
+                    return Err(invalid(
+                        "Effort line needs 2-128 ascending 20-20000 Hz points with effort 0-1",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Effort at `hz` for a recipe correcting `range`.
+    pub fn at(&self, hz: f64, range: Band) -> f64 {
+        if !range.contains(hz) {
+            return 0.0;
+        }
+        match self {
+            Self::Easy {
+                level,
+                low_fade_octaves,
+                high_fade_octaves,
+            } => {
+                let ramp = |octaves: f64, fade: f64| {
+                    if fade == 0.0 {
+                        1.0
+                    } else {
+                        (octaves / fade).clamp(0.0, 1.0)
+                    }
+                };
+                level
+                    * ramp((hz / range.low).log2(), *low_fade_octaves)
+                        .min(ramp((range.high / hz).log2(), *high_fade_octaves))
+            }
+            Self::Advanced(points) => {
+                let i = points.partition_point(|p| p.hz < hz);
+                match (i.checked_sub(1).map(|j| points[j]), points.get(i).copied()) {
+                    (Some(a), Some(b)) => {
+                        let t = (hz / a.hz).log2() / (b.hz / a.hz).log2();
+                        a.effort + t * (b.effort - a.effort)
+                    }
+                    (None, Some(p)) | (Some(p), None) => p.effort,
+                    (None, None) => unreachable!("validated effort line has points"),
+                }
+            }
+        }
+    }
+
+    /// The knots that draw this effort over `range`; an advanced line seeded from them is identical.
+    pub fn points(&self, range: Band) -> Vec<EffortPoint> {
+        match self {
+            Self::Easy {
+                level,
+                low_fade_octaves,
+                high_fade_octaves,
+            } => {
+                let low_knee = range.low * low_fade_octaves.exp2();
+                let high_knee = range.high / high_fade_octaves.exp2();
+                let mut points = Vec::with_capacity(4);
+                let mut push = |hz: f64, effort: f64| {
+                    if points.last().is_none_or(|p: &EffortPoint| p.hz < hz) {
+                        points.push(EffortPoint { hz, effort });
+                    }
+                };
+                push(
+                    range.low,
+                    if *low_fade_octaves == 0.0 {
+                        *level
+                    } else {
+                        0.0
+                    },
+                );
+                push(low_knee, *level);
+                push(high_knee, *level);
+                push(
+                    range.high,
+                    if *high_fade_octaves == 0.0 {
+                        *level
+                    } else {
+                        0.0
+                    },
+                );
+                points
+            }
+            Self::Advanced(points) => points.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        match self {
+            Self::Easy { level, .. } => *level == 0.0,
+            Self::Advanced(points) => points.iter().all(|p| p.effort == 0.0),
+        }
+    }
+}
+
+/// Response smoothing before target matching, blended from bass to treble width around a crossover.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Smoothing {
+    /// Gaussian FWHM in octaves below the transition.
+    pub bass_octaves: f64,
+    /// Gaussian FWHM in octaves above the transition.
+    pub treble_octaves: f64,
+    pub crossover_hz: f64,
+    /// Width of the linear-in-log blend centered on the crossover; zero switches abruptly.
+    pub transition_octaves: f64,
+}
+impl Default for Smoothing {
+    fn default() -> Self {
+        Self {
+            bass_octaves: 1.0 / 12.0,
+            treble_octaves: 1.0 / 3.0,
+            crossover_hz: 1000.0,
+            transition_octaves: 5.0,
+        }
+    }
+}
+impl Smoothing {
+    fn validate(self) -> Result<()> {
+        if !(0.0..=2.0).contains(&self.bass_octaves)
+            || !(0.0..=2.0).contains(&self.treble_octaves)
+            || !(20.0..=20000.0).contains(&self.crossover_hz)
+            || !(0.0..=8.0).contains(&self.transition_octaves)
         {
             return Err(invalid(
-                "Region effort, smoothing or independent fades are invalid",
+                "Smoothing must be 0-2 octaves with a 20-20000 Hz crossover and 0-8 octave transition",
             ));
         }
         Ok(())
     }
-    pub fn fit_fades(&mut self) {
-        let sum = self.lower_fade + self.upper_fade;
-        let span = self.band.octaves();
-        if sum > span {
-            self.lower_fade *= span / sum;
-            self.upper_fade *= span / sum;
-        }
+
+    /// Lower and upper edge of the transition in Hz.
+    pub fn transition(self) -> (f64, f64) {
+        let half = (self.transition_octaves / 2.0).exp2();
+        (self.crossover_hz / half, self.crossover_hz * half)
     }
-    fn weight(&self, f: f64) -> f64 {
-        if !self.band.contains(f) {
-            return 0.0;
-        }
-        let smooth = |x: f64| {
-            let x = x.clamp(0.0, 1.0);
-            x * x * (3.0 - 2.0 * x)
-        };
-        let low = if self.lower_fade == 0.0 {
-            1.0
+
+    /// Smoothing FWHM in octaves at `hz`.
+    pub fn width_at(self, hz: f64) -> f64 {
+        let blend = if self.transition_octaves == 0.0 {
+            if hz < self.crossover_hz { 0.0 } else { 1.0 }
         } else {
-            smooth((f / self.band.low).log2() / self.lower_fade)
+            ((hz / self.crossover_hz).log2() / self.transition_octaves + 0.5).clamp(0.0, 1.0)
         };
-        let high = if self.upper_fade == 0.0 {
-            1.0
-        } else {
-            smooth((self.band.high / f).log2() / self.upper_fade)
-        };
-        low.min(high)
+        self.bass_octaves * (1.0 - blend) + self.treble_octaves * blend
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,18 +428,15 @@ impl SpatialPolicy {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct Recipe {
     pub policy: String,
     pub alignment: Alignment,
     pub spatial: SpatialPolicy,
-    pub lower_fade: f64,
-    pub upper_fade: f64,
     pub target: Target,
     pub range: Band,
-    pub global_effort: f64,
-    pub smoothing_bass: f64,
-    pub smoothing_treble: f64,
-    pub regions: Vec<Region>,
+    pub effort: Effort,
+    pub smoothing: Smoothing,
     pub target_level: TargetLevel,
     pub maximum_boost_db: Option<f64>,
     pub maximum_cut_db: Option<f64>,
@@ -297,14 +448,10 @@ impl Default for Recipe {
             policy: "room-minphase-power-huber-v1".into(),
             alignment: Alignment::None,
             spatial: SpatialPolicy::SourceLayout,
-            lower_fade: 1.0 / 6.0,
-            upper_fade: 1.0 / 6.0,
             target: Target::Natural,
             range: Band::default(),
-            global_effort: 1.0,
-            smoothing_bass: 1.0 / 12.0,
-            smoothing_treble: 1.0 / 3.0,
-            regions: Vec::new(),
+            effort: Effort::default(),
+            smoothing: Smoothing::default(),
             target_level: TargetLevel::Automatic,
             maximum_boost_db: None,
             maximum_cut_db: None,
@@ -315,10 +462,9 @@ impl Default for Recipe {
 impl Recipe {
     pub fn validate(&self) -> Result<()> {
         Band::new(self.range.low, self.range.high)?;
+        self.effort.validate(self.range)?;
+        self.smoothing.validate()?;
         if self.policy != Self::default().policy
-            || !(0.0..=1.0).contains(&self.global_effort)
-            || !(0.0..=2.0).contains(&self.smoothing_bass)
-            || !(0.0..=2.0).contains(&self.smoothing_treble)
             || self
                 .maximum_boost_db
                 .is_some_and(|db| !(0.0..=24.0).contains(&db))
@@ -327,14 +473,6 @@ impl Recipe {
                 .is_some_and(|db| !(0.0..=36.0).contains(&db))
         {
             return Err(invalid("Unsupported room policy or correction limits"));
-        }
-        if !self.lower_fade.is_finite()
-            || !self.upper_fade.is_finite()
-            || self.lower_fade < 0.0
-            || self.upper_fade < 0.0
-            || self.lower_fade + self.upper_fade > self.range.octaves()
-        {
-            return Err(invalid("Correction range fades exceed the available band"));
         }
         if let SpatialPolicy::Reweighted(points) = &self.spatial {
             if points.is_empty()
@@ -396,111 +534,18 @@ impl Recipe {
                 "Imported room target does not cover the requested correction band; choose its declared range or import a wider target",
             ));
         }
-        for r in &self.regions {
-            r.validate()?;
-            if r.band.low < self.range.low || r.band.high > self.range.high {
-                return Err(invalid("Region is outside correction range"));
-            }
-        }
-        if self
-            .regions
-            .windows(2)
-            .any(|w| w[0].band.high > w[1].band.low)
-        {
-            return Err(invalid(
-                "Region overrides must be ordered and nonoverlapping",
-            ));
-        }
         Ok(())
     }
-    pub fn profile(&self, f: f64) -> (f64, f64) {
-        let blend = ((f / 200.0).log2() / (6000f64 / 200.0).log2()).clamp(0.0, 1.0);
-        let width = self.smoothing_bass * (1.0 - blend) + self.smoothing_treble * blend;
-        let (mut effort, mut smoothing) = (1.0, width);
-        if let Some(r) = self.regions.iter().find(|r| r.band.contains(f)) {
-            let w = r.weight(f);
-            effort += w * (r.effort - 1.0);
-            smoothing += w * (r.smoothing_octaves - width);
-        }
-        (
-            if self.range.contains(f) {
-                self.global_effort * effort
-            } else {
-                0.0
-            },
-            smoothing,
-        )
+    pub fn effort_at(&self, hz: f64) -> f64 {
+        self.effort.at(hz, self.range)
     }
-    pub fn insert_region(&mut self, region: Region) -> Result<()> {
-        region.validate()?;
-        let mut next = Vec::new();
-        for r in &self.regions {
-            if r.band.high <= region.band.low || r.band.low >= region.band.high {
-                next.push(r.clone());
-            } else {
-                if r.band.low < region.band.low {
-                    let mut left = r.clone();
-                    left.band.high = region.band.low;
-                    left.fit_fades();
-                    next.push(left);
-                }
-                if r.band.high > region.band.high {
-                    let mut right = r.clone();
-                    right.band.low = region.band.high;
-                    right.fit_fades();
-                    next.push(right);
-                }
-            }
-        }
-        next.push(region);
-        next.sort_by(|a, b| a.band.low.total_cmp(&b.band.low));
-        let old = std::mem::replace(&mut self.regions, next);
-        if let Err(e) = self.validate() {
-            self.regions = old;
-            return Err(e);
-        }
-        Ok(())
-    }
-    pub fn resize_region(&mut self, i: usize, lower: bool, f: f64) {
-        let previous = i
-            .checked_sub(1)
-            .map(|j| self.regions[j].band.high)
-            .unwrap_or(self.range.low);
-        let next = self
-            .regions
-            .get(i + 1)
-            .map_or(self.range.high, |r| r.band.low);
-        let shared = if lower {
-            i > 0 && previous == self.regions[i].band.low
-        } else {
-            i + 1 < self.regions.len() && next == self.regions[i].band.high
-        };
-        if lower {
-            let minimum = if shared {
-                self.regions[i - 1].band.low * 1.01
-            } else {
-                previous
-            };
-            let value = f.clamp(minimum, self.regions[i].band.high / 1.01);
-            self.regions[i].band.low = value;
-            if shared {
-                self.regions[i - 1].band.high = value;
-                self.regions[i - 1].fit_fades();
-            }
-        } else {
-            let maximum = if shared {
-                self.regions[i + 1].band.high / 1.01
-            } else {
-                next
-            };
-            let value = f.clamp(self.regions[i].band.low * 1.01, maximum);
-            self.regions[i].band.high = value;
-            if shared {
-                self.regions[i + 1].band.low = value;
-                self.regions[i + 1].fit_fades();
-            }
-        }
-        self.regions[i].fit_fades();
+}
+impl Serialize for Recipe {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        Recipe::serialize(self, serializer)
     }
 }
 
@@ -730,32 +775,35 @@ fn smooth(values: &[f32], f: &[f32], width: impl Fn(f64) -> f64) -> Vec<f64> {
         .collect()
 }
 
+/// `curve` after `smoothing`, as target matching sees it.
+pub fn smoothed(curve: &Curve, smoothing: Smoothing) -> Curve {
+    Curve {
+        frequency: curve.frequency.clone(),
+        db: smooth(&curve.db, &curve.frequency, |hz| smoothing.width_at(hz))
+            .into_iter()
+            .map(|v| v as f32)
+            .collect(),
+    }
+}
+
 fn smoothed_baseline(frozen: &Frozen) -> [Vec<f64>; 2] {
     std::array::from_fn(|c| {
         smooth(
             &frozen.baseline.magnitude[c].db,
             &frozen.target.frequency,
-            |hz| frozen.recipe.profile(hz).1,
+            |hz| frozen.recipe.smoothing.width_at(hz),
         )
     })
 }
 
 fn project(value: f64, i: usize, c: usize, frozen: &Frozen) -> f32 {
-    let f = f64::from(frozen.target.frequency[i]);
-    if frozen.recipe.profile(f).0 == 0.0 {
+    if frozen
+        .recipe
+        .effort_at(f64::from(frozen.target.frequency[i]))
+        == 0.0
+    {
         return 0.0;
     }
-    let lower = if frozen.recipe.lower_fade == 0.0 {
-        1.0
-    } else {
-        (f / frozen.recipe.range.low).log2() / frozen.recipe.lower_fade
-    };
-    let upper = if frozen.recipe.upper_fade == 0.0 {
-        1.0
-    } else {
-        (frozen.recipe.range.high / f).log2() / frozen.recipe.upper_fade
-    };
-    let edge = lower.min(upper).clamp(0.0, 1.0);
     let mut value = value;
     if let Some(limit) = frozen.recipe.maximum_cut_db {
         // Trim beyond the cut allowance leaves no room to cut, but never forces a boost.
@@ -764,7 +812,7 @@ fn project(value: f64, i: usize, c: usize, frozen: &Frozen) -> f32 {
     if let Some(limit) = frozen.recipe.maximum_boost_db {
         value = value.min((limit - 0.08).max(0.0) - frozen.alignment.trim_db[c]);
     }
-    (value * edge) as f32
+    value as f32
 }
 fn design(frozen: &Frozen, baseline: &[Vec<f64>; 2], offset: f64) -> [Vec<f32>; 2] {
     std::array::from_fn(|c| {
@@ -777,7 +825,7 @@ fn design(frozen: &Frozen, baseline: &[Vec<f64>; 2], offset: f64) -> [Vec<f32>; 
                 let measured = baseline[c][i];
                 let hz = f64::from(hz);
                 let value =
-                    frozen.recipe.profile(hz).0 * (frozen.recipe.target.db(hz) + offset - measured);
+                    frozen.recipe.effort_at(hz) * (frozen.recipe.target.db(hz) + offset - measured);
                 project(value, i, c, frozen)
             })
             .collect()
@@ -796,7 +844,7 @@ fn fit_cost(frozen: &Frozen, offset: f64, designed: &[Vec<f32>; 2]) -> f64 {
     for (c, channel) in designed.iter().enumerate() {
         for (i, &gain) in channel.iter().enumerate() {
             let f = f64::from(frozen.target.frequency[i]);
-            if frozen.recipe.profile(f).0 == 0.0 {
+            if frozen.recipe.effort_at(f) == 0.0 {
                 continue;
             }
             let desired = frozen.recipe.target.db(f) + offset;
@@ -951,7 +999,7 @@ fn freeze_design(source: &Source, id: ContentHash, recipe: Recipe, rate: Rate) -
     let smoothed = smoothed_baseline(&frozen);
     let offset = match frozen.recipe.target_level {
         TargetLevel::Fixed(db) => center + db,
-        TargetLevel::Automatic if frozen.recipe.global_effort == 0.0 => center,
+        TargetLevel::Automatic if frozen.recipe.effort.is_off() => center,
         TargetLevel::Automatic => {
             let mut candidates: Vec<_> = (-24..=24)
                 .map(|step| {
@@ -978,7 +1026,7 @@ fn freeze_design(source: &Source, id: ContentHash, recipe: Recipe, rate: Rate) -
         for (i, &hz) in f.iter().enumerate() {
             let b = frozen.baseline.magnitude[c].db[i];
             frozen.requested_goal[c].db[i] = b
-                + (frozen.recipe.profile(f64::from(hz)).0 * f64::from(frozen.target.db[i] - b))
+                + (frozen.recipe.effort_at(f64::from(hz)) * f64::from(frozen.target.db[i] - b))
                     as f32;
             frozen.processed_goal[c].db[i] = b + frozen.designed_db[c][i];
         }
@@ -1278,8 +1326,11 @@ mod realization_tests {
         let mut frozen = objective();
         frozen.recipe = Recipe {
             target: Target::Flat,
-            smoothing_bass: 0.0,
-            smoothing_treble: 0.0,
+            smoothing: Smoothing {
+                bass_octaves: 0.0,
+                treble_octaves: 0.0,
+                ..Smoothing::default()
+            },
             ..Recipe::default()
         };
         let i = frozen
@@ -1370,56 +1421,73 @@ mod realization_tests {
     }
 
     #[test]
-    fn regional_smoothing_is_local_and_realizes_a_bounded_filter() {
-        let mut frozen = objective();
-        let f = frozen.target.frequency.clone();
-        for channel in &mut frozen.baseline.magnitude {
-            for (db, &hz) in channel.db.iter_mut().zip(&f) {
-                *db = (6.0 * (-0.5 * ((f64::from(hz) / 1000.0).log2() / 0.1).powi(2)).exp()) as f32;
-            }
+    fn smoothing_crossover_blends_linearly_in_log_frequency() {
+        let smoothing = Smoothing {
+            bass_octaves: 0.1,
+            treble_octaves: 0.5,
+            crossover_hz: 1000.0,
+            transition_octaves: 2.0,
+        };
+        assert_eq!(smoothing.transition(), (500.0, 2000.0));
+        for (hz, expected) in [(100.0, 0.1), (500.0, 0.1), (1000.0, 0.3), (2000.0, 0.5)] {
+            assert!((smoothing.width_at(hz) - expected).abs() < 1e-12, "{hz} Hz");
         }
-        let original = design(&frozen, &smoothed_baseline(&frozen), 0.0);
-        frozen.recipe.regions.push(Region {
-            band: Band::new(500.0, 2000.0).unwrap(),
-            effort: 0.5,
-            smoothing_octaves: 0.5,
-            lower_fade: 0.5,
-            upper_fade: 0.5,
-        });
-        let changed = design(&frozen, &smoothed_baseline(&frozen), 0.0);
-        let peak = f.iter().position(|&hz| hz > 1000.0).unwrap();
-        assert!(changed[0][peak] > original[0][peak] * 0.5);
-        for (i, &hz) in f.iter().enumerate() {
-            if !(500.0..=2000.0).contains(&hz) {
-                assert_eq!(changed[0][i], original[0][i]);
-            }
-        }
-        let (_, evidence) = realize(&frozen, &changed, frozen.rate).unwrap();
-        evidence.validate().unwrap();
+        let step = Smoothing {
+            transition_octaves: 0.0,
+            ..smoothing
+        };
+        assert_eq!(step.width_at(999.0), 0.1);
+        assert_eq!(step.width_at(1000.0), 0.5);
     }
 
     #[test]
-    fn smoothing_applies_regional_effort_once() {
+    fn advanced_effort_line_is_applied_once_and_matches_its_easy_seed() {
         let mut frozen = objective();
-        frozen.recipe.smoothing_bass = 0.0;
-        frozen.recipe.smoothing_treble = 0.0;
-        frozen.recipe.regions.push(Region {
-            band: Band::new(400.0, 1600.0).unwrap(),
-            effort: 0.0,
-            smoothing_octaves: 0.0,
-            lower_fade: 1.0,
-            upper_fade: 1.0,
-        });
+        frozen.recipe.smoothing.bass_octaves = 0.0;
+        frozen.recipe.smoothing.treble_octaves = 0.0;
+        let easy = frozen.recipe.effort.clone();
+        let seeded = Effort::Advanced(easy.points(frozen.recipe.range));
+        for &hz in &frozen.target.frequency {
+            let hz = f64::from(hz);
+            assert!(
+                (easy.at(hz, frozen.recipe.range) - seeded.at(hz, frozen.recipe.range)).abs()
+                    < 1e-9
+            );
+        }
+        frozen.recipe.effort = Effort::Advanced(vec![
+            EffortPoint {
+                hz: 400.0,
+                effort: 1.0,
+            },
+            EffortPoint {
+                hz: 800.0,
+                effort: 0.0,
+            },
+            EffortPoint {
+                hz: 1600.0,
+                effort: 0.5,
+            },
+        ]);
+        frozen.recipe.validate().unwrap();
         let designed = design(&frozen, &smoothed_baseline(&frozen), -4.0);
         for (i, &hz) in frozen.target.frequency.iter().enumerate() {
-            let expected = -4.0 * frozen.recipe.profile(f64::from(hz)).0;
-            if (400.0..=1600.0).contains(&hz) {
-                assert!(
-                    (f64::from(designed[0][i]) - expected).abs() < 1e-5,
-                    "effort at {hz} Hz: {} != {expected}",
-                    designed[0][i]
-                );
+            let hz = f64::from(hz);
+            if !frozen.recipe.range.contains(hz) {
+                continue;
             }
+            let expected = if hz <= 400.0 {
+                1.0
+            } else if hz <= 800.0 {
+                1.0 - (hz / 400.0).log2()
+            } else if hz <= 1600.0 {
+                0.5 * (hz / 800.0).log2()
+            } else {
+                0.5
+            };
+            assert!(
+                (f64::from(designed[0][i]) + 4.0 * expected).abs() < 1e-4,
+                "{hz} Hz"
+            );
         }
     }
 

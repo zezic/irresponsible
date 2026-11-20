@@ -3030,10 +3030,16 @@ impl App {
                 };
                 match result {
                     Ok(JobResult::RoomPrepared(session, view, engine)) => {
+                        let following = self.room.listening_to_candidate(self.active.hash);
                         match self.accept_room_preparation(session) {
                             Ok(()) => {
                                 self.preview = Some((view, engine));
-                                self.message = "Prepared a new room filter. New coefficients require measured verification.".into();
+                                if following {
+                                    self.replace_loaded();
+                                    self.message = "Listening to the updated room filter. New coefficients require measured verification.".into();
+                                } else {
+                                    self.message = "Prepared a new room filter. New coefficients require measured verification.".into();
+                                }
                             }
                             Err(error) => self.message = error.to_string(),
                         }

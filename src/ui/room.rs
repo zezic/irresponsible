@@ -32,8 +32,7 @@ pub(super) fn render_preview(
     });
     app.open_room_session(id)?;
     app.room.opened = true;
-    app.message =
-        "Drag across the graph to add a region; drag its boundary lines to resize.".into();
+    app.message = "Drag effort knots on the graph; drag the smoothing band at its top.".into();
     app.room.stage = match state {
         PreviewState::RoomSetup => Stage::Setup,
         PreviewState::RoomVerification => Stage::Correction,
@@ -250,13 +249,6 @@ impl NativeSmoke {
         self.capture_at("correction-minimum.png", [880, 760])?;
         self.click(
             event_loop,
-            super::Action::Room(Action::Dialog(Some(Dialog::Target))),
-        )?;
-        self.capture("target-settings.png")?;
-        self.capture_at("target-minimum.png", [880, 760])?;
-        self.click(event_loop, super::Action::Room(Action::Dialog(None)))?;
-        self.click(
-            event_loop,
             super::Action::Room(Action::Dialog(Some(Dialog::Measurements))),
         )?;
         self.capture("measurements.png")?;
@@ -460,21 +452,28 @@ impl NativeSmoke {
                 if self.app.awaiting.is_none() && self.app.active.hash == original =>
             {
                 self.app.room_action(Action::BackToCandidate)?;
-                let plot = self.app.room.graph;
-                self.app.cursor = Point::new(
-                    plot.x0 + (300f64 / 20.0).log10() / 3.0 * plot.width(),
-                    plot.center().y,
-                );
+                self.click_scrolled(
+                    event_loop,
+                    super::Action::Room(Action::SetEffortMode(EffortMode::Advanced)),
+                )?;
+                let overlay = Overlay::new(self.app.room.graph);
+                let level = self
+                    .app
+                    .settings
+                    .room
+                    .recipe
+                    .effort
+                    .at(1000.0, self.app.settings.room.recipe.range);
+                self.app.cursor = overlay.point(1000.0, level);
                 self.app.begin_room_drag();
-                self.app.cursor.x = plot.x0 + (1000f64 / 20.0).log10() / 3.0 * plot.width();
+                self.app.cursor.y = overlay.y(0.5);
                 let Some(super::Drag::Room(drag)) = self.app.dragging else {
-                    return Err(invalid("Native graph did not admit region drag"));
+                    return Err(invalid("Native graph did not admit an effort knot"));
                 };
                 self.app.room_drag(drag, true);
                 self.app.dragging = None;
-                self.app.room_number(Parameter::RegionEffort, 50.0)?;
                 self.phase = SmokePhase::Edit;
-                println!("Native smoke: regional edit from immutable source");
+                println!("Native smoke: effort line edit from immutable source");
             }
             SmokePhase::Edit if self.app.job.is_none() => {
                 let pass = self.app.room.history.last().expect("edited pass");
@@ -489,7 +488,7 @@ impl NativeSmoke {
                         .preferred
                         .is_some()
                 );
-                self.capture("regional-edit.png")?;
+                self.capture("effort-edit.png")?;
                 self.app.room_action(Action::Fold(Section::Diagnostics))?;
                 self.app.build_scene(Size::new(880.0, 760.0), 1.0);
                 self.app.room.settings_scroll = (self.app.room.settings_height
@@ -590,7 +589,6 @@ pub enum Stage {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Dialog {
     Verification,
-    Target,
     Measurements,
     Uncalibrated(RunKind),
     MeasurementName,
@@ -599,8 +597,7 @@ pub enum Dialog {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Section {
     Acquisition,
-    FilterLimits,
-    Regions,
+    Advanced,
     Diagnostics,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -609,24 +606,53 @@ pub enum TargetPreset {
     Natural,
     Warm,
     Flat,
+    /// Editable tilt, bass shelf and mid bell, seeded from the current target.
+    Custom,
 }
 impl TargetPreset {
+    const ALL: [Self; 5] = [
+        Self::Gentle,
+        Self::Natural,
+        Self::Warm,
+        Self::Flat,
+        Self::Custom,
+    ];
     fn label(self) -> &'static str {
         match self {
             Self::Gentle => "Gentle",
             Self::Natural => "Natural",
             Self::Warm => "Warm",
             Self::Flat => "Flat",
+            Self::Custom => "Custom",
         }
     }
-    fn target(self) -> correction::Target {
+    /// The target this chip selects when the current target is `current`.
+    fn target(self, current: &correction::Target) -> correction::Target {
         match self {
             Self::Gentle => correction::Target::Gentle,
             Self::Natural => correction::Target::Natural,
             Self::Warm => correction::Target::Warm,
             Self::Flat => correction::Target::Flat,
+            Self::Custom => {
+                correction::Target::Parametric(current.parameters().unwrap_or_default())
+            }
         }
     }
+    fn selects(self, target: &correction::Target) -> bool {
+        matches!(
+            (self, target),
+            (Self::Gentle, correction::Target::Gentle)
+                | (Self::Natural, correction::Target::Natural)
+                | (Self::Warm, correction::Target::Warm)
+                | (Self::Flat, correction::Target::Flat)
+                | (Self::Custom, correction::Target::Parametric(_))
+        )
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffortMode {
+    Easy,
+    Advanced,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChoiceField {
@@ -656,9 +682,7 @@ pub enum Action {
     SetPlot(PlotKind),
     Trace(Trace),
     SetChannels(Channels),
-    SelectRegion(usize),
-    AddRegion,
-    ResetRegions,
+    SetEffortMode(EffortMode),
     ChooseMicrophone(usize),
     MicrophoneChannel,
     ChooseMicrophoneChannel(MonoChannel),
@@ -703,7 +727,6 @@ pub enum Action {
     SaveCandidate,
     SaveMeasurement,
     OpenMeasurement(ContentHash),
-    RemoveRegion,
     Graph,
     Export,
     ExportFilter,
@@ -719,14 +742,17 @@ impl Action {
             Self::MicrophoneChannel => {
                 "Choose one of the selected microphone device's exposed input channels."
             }
-            Self::Dialog(Some(Dialog::Target)) => {
-                "Room target, common target level, boost/cut bounds, supported range and FIR settings."
-            }
             Self::Dialog(Some(Dialog::Verification)) => {
                 "Measure the applied correction without changing it."
             }
-            Self::Graph | Self::AddRegion => {
-                "Drag across the graph to add an override. Select a region or drag its vertical boundary lines to resize it."
+            Self::Graph => {
+                "Drag the effort line knots to shape correction strength; drag the smoothing band at the top to move the crossover or its edges. In advanced effort, click the line to add a knot and Alt-click a knot to remove it."
+            }
+            Self::SetEffortMode(EffortMode::Advanced) => {
+                "Shape effort freely along frequency. Starts from the current easy line."
+            }
+            Self::SetEffortMode(EffortMode::Easy) => {
+                "One effort level with fades at both ends of the correction range."
             }
             Self::BoostLimit => "Enable the maximum boost in dB. Disabled by default.",
             Self::CutLimit => "Enable cut limiting. Disabled by default.",
@@ -773,11 +799,17 @@ impl Parameter {
                 "Dedicated background recording duration at the same microphone gain as the sweeps."
             }
             Self::Low | Self::High | Self::LfHigh => "Requested frequency boundary.",
-            Self::Effort | Self::RegionEffort => {
+            Self::Effort => {
                 "Correction strength controls how far the response moves toward the target."
             }
-            Self::BassSmoothing | Self::TrebleSmoothing | Self::RegionSmoothing => {
+            Self::LowFade | Self::HighFade => {
+                "Octaves over which effort rises from zero at the correction range edge."
+            }
+            Self::BassSmoothing | Self::TrebleSmoothing => {
                 "Gaussian smoothing of the measured response before target matching, in octave FWHM. Effort is applied afterward; enabled gain limits take precedence. Zero disables smoothing. Alt-click a bar to reset it."
+            }
+            Self::Crossover | Self::Transition => {
+                "Bass smoothing applies below the transition band and treble smoothing above it, blended linearly across the band."
             }
 
             Self::Boost => {
@@ -815,8 +847,12 @@ pub enum Parameter {
     Low,
     High,
     Effort,
+    LowFade,
+    HighFade,
     BassSmoothing,
     TrebleSmoothing,
+    Crossover,
+    Transition,
     Boost,
     Cut,
     Offset,
@@ -829,8 +865,6 @@ pub enum Parameter {
     MoveSeconds,
     ExcitationLow,
     ExcitationHigh,
-    RegionEffort,
-    RegionSmoothing,
     Tilt,
     Bass,
     MidGain,
@@ -840,8 +874,6 @@ pub enum Parameter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bar {
     Effort,
-    RegionEffort,
-    RegionSmoothing,
     BassSmoothing,
     TrebleSmoothing,
 }
@@ -849,28 +881,21 @@ impl Bar {
     pub(super) fn parameter(self) -> Parameter {
         match self {
             Self::Effort => Parameter::Effort,
-            Self::RegionEffort => Parameter::RegionEffort,
-            Self::RegionSmoothing => Parameter::RegionSmoothing,
-
             Self::BassSmoothing => Parameter::BassSmoothing,
             Self::TrebleSmoothing => Parameter::TrebleSmoothing,
         }
     }
-    fn maximum(self, _recipe: &correction::Recipe, _region: Option<usize>) -> f64 {
+    fn maximum(self) -> f64 {
         match self {
-            Self::Effort | Self::RegionEffort => 100.0,
-
-            _ => 2.0,
+            Self::Effort => 100.0,
+            Self::BassSmoothing | Self::TrebleSmoothing => 2.0,
         }
     }
     fn label(self) -> &'static str {
         match self {
-            Self::Effort => "Overall correction effort",
-            Self::RegionEffort => "Region effort",
-            Self::RegionSmoothing => "Filter smoothing",
-
-            Self::BassSmoothing => "Bass smoothing",
-            Self::TrebleSmoothing => "Treble smoothing",
+            Self::Effort => "Effort",
+            Self::BassSmoothing => "Bass",
+            Self::TrebleSmoothing => "Treble",
         }
     }
 }
@@ -881,10 +906,10 @@ impl Parameter {
             | Self::High
             | Self::MidCenter
             | Self::Effort
-            | Self::RegionEffort
+            | Self::Crossover
             | Self::ExcitationLow
             | Self::ExcitationHigh => format!("{value:.0}"),
-            Self::BassSmoothing | Self::TrebleSmoothing | Self::RegionSmoothing => {
+            Self::BassSmoothing | Self::TrebleSmoothing | Self::LowFade | Self::HighFade => {
                 format!("{value:.2}")
             }
             _ => format!("{value:.1}"),
@@ -893,8 +918,12 @@ impl Parameter {
 
     pub fn step(self) -> f32 {
         match self {
-            Self::Effort | Self::RegionEffort => 5.0,
-            Self::BassSmoothing | Self::TrebleSmoothing | Self::RegionSmoothing => 1.0 / 24.0,
+            Self::Effort => 5.0,
+            Self::BassSmoothing | Self::TrebleSmoothing | Self::LowFade | Self::HighFade => {
+                1.0 / 24.0
+            }
+            Self::Transition => 0.5,
+            Self::Crossover => 50.0,
             Self::Tilt => 0.1,
             Self::Bass | Self::MidGain => 0.5,
             Self::MidWidth => 0.1,
@@ -911,9 +940,13 @@ impl Parameter {
         match self {
             Self::Low => "Correction from / Hz",
             Self::High => "Correction to / Hz",
-            Self::Effort => "Global effort / %",
+            Self::Effort => "Effort / %",
+            Self::LowFade => "Low fade / oct",
+            Self::HighFade => "High fade / oct",
             Self::BassSmoothing => "Bass smoothing / oct",
             Self::TrebleSmoothing => "Treble smoothing / oct",
+            Self::Crossover => "Crossover / Hz",
+            Self::Transition => "Transition / oct",
             Self::Boost => "Maximum boost / dB",
             Self::Cut => "Maximum cut / dB",
             Self::Offset => "Manual target offset / dB",
@@ -927,8 +960,6 @@ impl Parameter {
 
             Self::ExcitationLow => "Sweep excitation from / Hz",
             Self::ExcitationHigh => "Sweep excitation to / Hz",
-            Self::RegionEffort => "Regional effort / %",
-            Self::RegionSmoothing => "Regional smoothing / oct",
 
             Self::Tilt => "Downward tilt / dB per octave",
             Self::Bass => "Target bass shelf / dB",
@@ -940,8 +971,15 @@ impl Parameter {
 }
 #[derive(Clone, Copy, PartialEq)]
 pub enum Drag {
-    Create { start: f64, current: f64 },
-    Boundary { region: usize, lower: bool },
+    /// An easy-effort knee: horizontal sets that side's fade, vertical sets the level.
+    Knee {
+        lower: bool,
+    },
+    /// An advanced effort knot by index.
+    Knot(usize),
+    Crossover,
+    /// A transition band edge; its distance from the crossover sets the width.
+    TransitionEdge,
 }
 pub(super) struct ListeningRestore {
     pub correction: ContentHash,
@@ -951,39 +989,44 @@ pub(super) struct ListeningRestore {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trace {
+    /// Baseline after the recipe's smoothing, as the fit sees it.
     Measured,
+    /// Baseline before smoothing.
+    Raw,
     Target,
-    Goal,
     Predicted,
     Verified,
     Spread,
+    Effort,
 }
 impl Trace {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Measured,
+        Self::Raw,
         Self::Target,
-        Self::Goal,
         Self::Predicted,
         Self::Verified,
         Self::Spread,
+        Self::Effort,
     ];
     fn label(self) -> &'static str {
         match self {
-            Self::Measured => "Baseline",
+            Self::Measured => "Measured (smoothed)",
+            Self::Raw => "Raw",
             Self::Target => "Target",
-            Self::Goal => "Processed goal",
             Self::Predicted => "Predicted",
             Self::Verified => "Measured result",
             Self::Spread => "Area spread",
+            Self::Effort => "Effort",
         }
     }
     fn color(self, colors: appearance::Colors) -> vello::peniko::Color {
         match self {
-            Self::Measured | Self::Spread => colors.secondary,
+            Self::Measured | Self::Raw | Self::Spread => colors.secondary,
             Self::Target => colors.basic[5],
-            Self::Goal => colors.basic[6],
             Self::Predicted => colors.basic[2],
             Self::Verified => colors.basic[3],
+            Self::Effort => colors.basic[1],
         }
     }
 }
@@ -1020,7 +1063,6 @@ pub struct Workspace {
     settings_height: f64,
     graph: Rect,
     settings_bounds: Rect,
-    selected_region: Option<usize>,
     selected_point: usize,
     name: String,
     pub(super) return_to: Option<ListeningRestore>,
@@ -1034,6 +1076,12 @@ pub struct Workspace {
     levels: [Option<measurement::levels::Report>; 2],
     previous: Option<ContentHash>,
     latest_noise: Option<measurement::Noise>,
+}
+impl Workspace {
+    /// Whether playback holds this workspace's candidate, so a prepared edit should replace it.
+    pub(super) fn listening_to_candidate(&self, active: ContentHash) -> bool {
+        self.opened && self.return_to.is_none() && self.candidate == Some(active)
+    }
 }
 impl Default for Workspace {
     fn default() -> Self {
@@ -1059,12 +1107,14 @@ impl Default for Workspace {
             settings_height: 0.0,
             graph: Rect::ZERO,
             settings_bounds: Rect::ZERO,
-            selected_region: None,
             selected_point: 0,
             name: "Listening room".into(),
             return_to: None,
             plot_kind: PlotKind::RoomResponse,
-            traces: Trace::ALL.into_iter().collect(),
+            traces: Trace::ALL
+                .into_iter()
+                .filter(|&t| t != Trace::Raw)
+                .collect(),
             channels: Channels::Both,
             compare_parent: true,
             show_unsmoothed: false,
@@ -1108,16 +1158,6 @@ fn comparable_parent(pass: &Pass, parent: &Pass) -> bool {
     pass.objective == parent.objective
         && match (&pass.scope, &parent.scope) {
             (Scope::Prediction { band: a }, Scope::Prediction { band: b }) => a == b,
-            (
-                Scope::Targeted {
-                    position: a,
-                    band: x,
-                },
-                Scope::Targeted {
-                    position: b,
-                    band: y,
-                },
-            ) => a == b && x == y,
             (
                 Scope::ReferenceFull {
                     position: a,
@@ -1208,13 +1248,12 @@ impl App {
         if matches!(
             action,
             SetTarget(_)
+                | SetEffortMode(_)
                 | ImportTarget
                 | AutoLevel
                 | BoostLimit
                 | CutLimit
                 | Alignment
-                | RemoveRegion
-                | ResetRegions
         ) {
             self.branch_room_recipe();
         }
@@ -1260,8 +1299,24 @@ impl App {
                     self.room.expanded.insert(section);
                 }
             }
-            SetTarget(target) => {
-                self.settings.room.recipe.target = target.target();
+            SetTarget(preset) => {
+                let recipe = &mut self.settings.room.recipe;
+                recipe.target = preset.target(&recipe.target);
+                self.room_changed();
+            }
+            SetEffortMode(mode) => {
+                let recipe = &mut self.settings.room.recipe;
+                recipe.effort = match (mode, &recipe.effort) {
+                    (EffortMode::Easy, correction::Effort::Advanced(points)) => {
+                        correction::Effort::easy(
+                            points.iter().map(|p| p.effort).fold(0.0, f64::max),
+                        )
+                    }
+                    (EffortMode::Advanced, easy @ correction::Effort::Easy { .. }) => {
+                        correction::Effort::Advanced(easy.points(recipe.range))
+                    }
+                    _ => return Ok(()),
+                };
                 self.room_changed();
             }
             Trace(trace) => {
@@ -1271,16 +1326,6 @@ impl App {
             }
             SetPlot(kind) => self.room.plot_kind = kind,
             SetChannels(channels) => self.room.channels = channels,
-            SelectRegion(i) => self.room.selected_region = Some(i),
-            AddRegion => {
-                self.room.expanded.insert(Section::Regions);
-                self.message = "Drag across the response graph to add a regional override.".into()
-            }
-            ResetRegions => {
-                self.settings.room.recipe.regions.clear();
-                self.room.selected_region = None;
-                self.room_changed();
-            }
             ParentComparison => self.room.compare_parent = !self.room.compare_parent,
             PointView => {
                 let count = self.room.source.as_ref().map_or(0, |s| s.points.len());
@@ -1582,7 +1627,6 @@ impl App {
             }
 
             SelectPass(id) => {
-                self.room.selected_region = None;
                 self.room.selected = Some(id);
                 if !self.room.running {
                     self.room.active_band = None;
@@ -1592,7 +1636,6 @@ impl App {
             BackToCandidate => {
                 self.stop_room_audition()?;
                 self.room.selected = None;
-                self.room.selected_region = None;
                 let candidate = self
                     .room
                     .history
@@ -1700,12 +1743,6 @@ impl App {
                 self.message="Reopened saved measurement evidence. Edit correction settings without measuring again.".into();
             }
 
-            RemoveRegion => {
-                if let Some(i) = self.room.selected_region.take() {
-                    self.settings.room.recipe.regions.remove(i);
-                    self.room_changed();
-                }
-            }
             Graph => {}
             Export => {
                 let id = self
@@ -1973,13 +2010,28 @@ impl App {
         let pref = &self.settings.room;
         let r = self.room_recipe();
         let a = &pref.acquisition;
-        let region = self.room.selected_region.and_then(|i| r.regions.get(i));
+        let (level, low_fade, high_fade) = match r.effort {
+            correction::Effort::Easy {
+                level,
+                low_fade_octaves,
+                high_fade_octaves,
+            } => (level, low_fade_octaves, high_fade_octaves),
+            correction::Effort::Advanced(ref points) => (
+                points.iter().map(|p| p.effort).fold(0.0, f64::max),
+                0.0,
+                0.0,
+            ),
+        };
         match p {
             Low => r.range.low,
             High => r.range.high,
-            Effort => r.global_effort * 100.0,
-            BassSmoothing => r.smoothing_bass,
-            TrebleSmoothing => r.smoothing_treble,
+            Effort => level * 100.0,
+            LowFade => low_fade,
+            HighFade => high_fade,
+            BassSmoothing => r.smoothing.bass_octaves,
+            TrebleSmoothing => r.smoothing.treble_octaves,
+            Crossover => r.smoothing.crossover_hz,
+            Transition => r.smoothing.transition_octaves,
             Boost => r
                 .maximum_boost_db
                 .expect("boost control requires an enabled limiter"),
@@ -2004,9 +2056,6 @@ impl App {
             ExcitationLow => a.band.low,
             ExcitationHigh => a.band.high,
 
-            RegionEffort => region.map_or(100.0, |r| r.effort * 100.0),
-            RegionSmoothing => region.map_or(0.0, |r| r.smoothing_octaves),
-
             Tilt => r.target.parameters().map_or(0.0, |p| p.tilt_db_octave),
             Bass => r.target.parameters().map_or(0.0, |p| p.bass_db),
             MidGain => r.target.parameters().map_or(0.0, |p| p.mid_gain_db),
@@ -2027,9 +2076,25 @@ impl App {
         match p {
             Low => r.range = measurement::Band::new(value, r.range.high)?,
             High => r.range = measurement::Band::new(r.range.low, value)?,
-            Effort => r.global_effort = value / 100.0,
-            BassSmoothing => r.smoothing_bass = value,
-            TrebleSmoothing => r.smoothing_treble = value,
+            Effort | LowFade | HighFade => {
+                let correction::Effort::Easy {
+                    level,
+                    low_fade_octaves,
+                    high_fade_octaves,
+                } = &mut r.effort
+                else {
+                    unreachable!("easy effort controls are shown only for easy effort")
+                };
+                match p {
+                    Effort => *level = value / 100.0,
+                    LowFade => *low_fade_octaves = value,
+                    _ => *high_fade_octaves = value,
+                }
+            }
+            BassSmoothing => r.smoothing.bass_octaves = value,
+            TrebleSmoothing => r.smoothing.treble_octaves = value,
+            Crossover => r.smoothing.crossover_hz = value,
+            Transition => r.smoothing.transition_octaves = value,
             Boost => r.maximum_boost_db = Some(value),
             Cut => r.maximum_cut_db = Some(value),
             Offset => r.target_level = correction::TargetLevel::Fixed(value),
@@ -2087,24 +2152,6 @@ impl App {
                 }
                 r.target = correction::Target::Parametric(parameters);
             }
-
-            RegionEffort | RegionSmoothing => {
-                let i = self
-                    .room
-                    .selected_region
-                    .ok_or_else(|| invalid("Select a region"))?;
-                let region = &mut r.regions[i];
-                match p {
-                    RegionEffort => region.effort = value / 100.0,
-                    RegionSmoothing => region.smoothing_octaves = value,
-
-                    _ => unreachable!(),
-                };
-                if region.lower_fade < 0.0 || region.upper_fade < 0.0 {
-                    return Err(invalid("Fade widths cannot be negative"));
-                }
-                region.fit_fades();
-            }
         }
         r.validate()?;
         a.validate(self.current_rate())?;
@@ -2122,13 +2169,15 @@ impl App {
             p,
             Low | High
                 | Effort
+                | LowFade
+                | HighFade
                 | BassSmoothing
                 | TrebleSmoothing
+                | Crossover
+                | Transition
                 | Boost
                 | Cut
                 | Offset
-                | RegionEffort
-                | RegionSmoothing
                 | Tilt
                 | Bass
                 | MidGain
@@ -2311,81 +2360,138 @@ impl App {
     fn room_frequency(&self, x: f64) -> f64 {
         20.0 * 1000f64.powf(((x - self.room.graph.x0) / self.room.graph.width()).clamp(0.0, 1.0))
     }
+    /// The graph handle under the cursor, if any.
+    fn room_handle(&self) -> Option<Drag> {
+        let overlay = Overlay::new(self.room.graph);
+        let recipe = self.room_recipe();
+        if overlay.strip.contains(self.cursor) {
+            let (low, high) = recipe.smoothing.transition();
+            let near = |hz: f64| (overlay.x(hz) - self.cursor.x).abs() < 7.0;
+            return if near(recipe.smoothing.crossover_hz) {
+                Some(Drag::Crossover)
+            } else if near(low) || near(high) {
+                Some(Drag::TransitionEdge)
+            } else {
+                None
+            };
+        }
+        if !self.room.traces.contains(&Trace::Effort) {
+            return None;
+        }
+        let near =
+            |p: &correction::EffortPoint| overlay.point(p.hz, p.effort).distance(self.cursor) < 8.0;
+        match &recipe.effort {
+            correction::Effort::Easy {
+                low_fade_octaves,
+                high_fade_octaves,
+                level,
+            } => [
+                (true, recipe.range.low * low_fade_octaves.exp2()),
+                (false, recipe.range.high / high_fade_octaves.exp2()),
+            ]
+            .into_iter()
+            .find(|&(_, hz)| near(&correction::EffortPoint { hz, effort: *level }))
+            .map(|(lower, _)| Drag::Knee { lower }),
+            correction::Effort::Advanced(points) => points.iter().position(near).map(Drag::Knot),
+        }
+    }
     pub(super) fn begin_room_drag(&mut self) {
-        if self.room.running {
+        if self.room.running || self.room.plot_kind != PlotKind::RoomResponse {
             return;
         }
         self.branch_room_recipe();
-        let plot = self.room.graph;
-        let x = self.cursor.x;
-        for (i, r) in self.settings.room.recipe.regions.iter().enumerate() {
-            for (lower, f) in [(true, r.band.low), (false, r.band.high)] {
-                let at = plot.x0 + (f / 20.0).log10() / 3.0 * plot.width();
-                if (x - at).abs() < 7.0 {
-                    self.room.selected_region = Some(i);
-                    self.dragging = Some(super::Drag::Room(Drag::Boundary { region: i, lower }));
-                    return;
-                }
-            }
-        }
-        self.dragging = Some(super::Drag::Room(Drag::Create {
-            start: x,
-            current: x,
-        }));
-    }
-
-    pub(super) fn room_drag(&mut self, drag: Drag, finished: bool) {
-        match drag {
-            Drag::Boundary { region, lower } => {
-                let f = self.room_frequency(self.cursor.x);
-                self.settings.room.recipe.resize_region(region, lower, f);
-                if finished {
+        let handle = self.room_handle();
+        let overlay = Overlay::new(self.room.graph);
+        let hz = self.room_frequency(self.cursor.x);
+        let recipe = &mut self.settings.room.recipe;
+        let correction::Effort::Advanced(points) = &mut recipe.effort else {
+            self.dragging = handle.map(super::Drag::Room);
+            return;
+        };
+        match handle {
+            Some(Drag::Knot(i)) if self.modifiers.alt_key() => {
+                if points.len() > 2 {
+                    points.remove(i);
                     self.room_changed();
                 }
             }
-            Drag::Create { start, .. } => {
-                let current = self.cursor.x;
-                self.dragging = Some(super::Drag::Room(Drag::Create { start, current }));
-                if finished {
-                    let lo = self.room_frequency(start.min(current));
-                    let hi = self.room_frequency(start.max(current));
-                    if (start - current).abs() < 8.0 {
-                        self.room.selected_region = self
-                            .settings
-                            .room
-                            .recipe
-                            .regions
-                            .iter()
-                            .position(|r| r.band.contains(lo));
-                    } else if let Ok(band) = measurement::Band::new(
-                        lo.max(self.settings.room.recipe.range.low),
-                        hi.min(self.settings.room.recipe.range.high),
-                    ) {
-                        let fade = (band.octaves() / 4.0).min(1.0 / 6.0);
-                        let width = self.settings.room.recipe.profile((lo * hi).sqrt()).1;
-                        match self.settings.room.recipe.insert_region(correction::Region {
-                            band,
-                            effort: 1.0,
-                            smoothing_octaves: width,
-                            lower_fade: fade,
-                            upper_fade: fade,
-                        }) {
-                            Ok(()) => {
-                                self.room.expanded.insert(Section::Regions);
-                                self.room.selected_region = self
-                                    .settings
-                                    .room
-                                    .recipe
-                                    .regions
-                                    .iter()
-                                    .position(|r| r.band == band);
-                                self.room_changed();
-                            }
-                            Err(e) => self.message = e.to_string(),
-                        }
-                    }
+            Some(handle) => self.dragging = Some(super::Drag::Room(handle)),
+            None if self.room.traces.contains(&Trace::Effort) => {
+                let range = recipe.range;
+                let on_line = (overlay.y(recipe.effort.at(hz, range)) - self.cursor.y).abs() < 8.0;
+                let correction::Effort::Advanced(points) = &mut recipe.effort else {
+                    unreachable!("checked above")
+                };
+                let i = points.partition_point(|p| p.hz < hz);
+                let free = points.get(i).is_none_or(|p| p.hz > hz * 1.01)
+                    && i.checked_sub(1).is_none_or(|j| points[j].hz < hz / 1.01);
+                if on_line && free && points.len() < correction::Effort::MAX_POINTS {
+                    points.insert(
+                        i,
+                        correction::EffortPoint {
+                            hz,
+                            effort: overlay.effort(self.cursor.y),
+                        },
+                    );
+                    self.dragging = Some(super::Drag::Room(Drag::Knot(i)));
                 }
             }
+            None => {}
+        }
+    }
+
+    pub(super) fn room_drag(&mut self, drag: Drag, finished: bool) {
+        let overlay = Overlay::new(self.room.graph);
+        let hz = self.room_frequency(self.cursor.x);
+        let effort = overlay.effort(self.cursor.y);
+        let mut recipe = self.settings.room.recipe.clone();
+        let range = recipe.range;
+        match (drag, &mut recipe.effort) {
+            (
+                Drag::Knee { lower },
+                correction::Effort::Easy {
+                    level,
+                    low_fade_octaves,
+                    high_fade_octaves,
+                },
+            ) => {
+                *level = effort;
+                let (fade, other) = if lower {
+                    ((hz / range.low).log2(), *high_fade_octaves)
+                } else {
+                    ((range.high / hz).log2(), *low_fade_octaves)
+                };
+                let fade = fade.clamp(0.0, (range.octaves() - other).max(0.0));
+                if lower {
+                    *low_fade_octaves = fade;
+                } else {
+                    *high_fade_octaves = fade;
+                }
+            }
+            (Drag::Knot(i), correction::Effort::Advanced(points)) => {
+                let low = i.checked_sub(1).map_or(20.0, |j| points[j].hz * 1.01);
+                let high = points.get(i + 1).map_or(20000.0, |p| p.hz / 1.01);
+                points[i] = correction::EffortPoint {
+                    hz: hz.clamp(low, high),
+                    effort,
+                };
+            }
+            (Drag::Crossover, _) => {
+                recipe.smoothing.crossover_hz = hz.clamp(20.0, 20000.0);
+            }
+            (Drag::TransitionEdge, _) => {
+                recipe.smoothing.transition_octaves =
+                    (2.0 * (hz / recipe.smoothing.crossover_hz).log2().abs()).min(8.0);
+            }
+            _ => unreachable!("effort handles match the effort mode"),
+        }
+        match recipe.validate() {
+            Ok(()) => self.settings.room.recipe = recipe,
+            Err(error) => self.message = error.to_string(),
+        }
+        self.dirty = true;
+        if finished {
+            self.room_changed();
         }
     }
     pub(super) fn room_scroll(&mut self, amount: f64) {
@@ -2404,7 +2510,6 @@ struct MeasuredCurves {
 }
 struct ResponseTraces {
     baseline: [Curve; 2],
-    goal: [Curve; 2],
     predicted: [Curve; 2],
     measured: Option<MeasuredCurves>,
     parent: Option<MeasuredCurves>,
@@ -2421,6 +2526,7 @@ struct PlotData {
     spread_db: [Vec<f32>; 2],
     spatial: ResponseTraces,
     points: Vec<ResponseTraces>,
+    smoothed: Option<Smoothed>,
 }
 impl App {
     fn room_plot_for(&self, pass: &Pass) -> Result<PlotData> {
@@ -2534,7 +2640,6 @@ impl App {
         let spatial = ResponseTraces {
             predicted: add(&baseline, &filter),
             baseline,
-            goal: frozen.processed_goal.clone(),
             measured: spatial_measurement(pass)?,
             parent: parent_spatial,
         };
@@ -2545,15 +2650,6 @@ impl App {
             .enumerate()
             .map(|(position, point)| {
                 let baseline = raw(point);
-                let goal = std::array::from_fn(|c| Curve {
-                    frequency: frozen.target.frequency.clone(),
-                    db: point[c]
-                        .db
-                        .iter()
-                        .zip(&frozen.designed_db[c])
-                        .map(|(&b, &g)| b + g)
-                        .collect(),
-                });
                 let parent = parent.and_then(|p| measured_at(p, position)).or_else(|| {
                     parent_filter.as_ref().map(|filter| MeasuredCurves {
                         curves: add(&baseline, filter),
@@ -2563,7 +2659,6 @@ impl App {
                 ResponseTraces {
                     predicted: add(&baseline, &filter),
                     baseline,
-                    goal,
                     measured: measured_at(pass, position),
                     parent,
                 }
@@ -2590,6 +2685,7 @@ impl App {
             spread_db: frozen.baseline.spread_db,
             spatial,
             points,
+            smoothed: None,
         })
     }
     fn room_preset_name(&mut self, source: ContentHash, name: String) {
@@ -2603,23 +2699,18 @@ impl App {
         self.room.dialog = Some(Dialog::PresetName);
     }
     pub(super) fn room_graph_cursor(&self) -> winit::window::CursorIcon {
-        if self.room.running {
-            return winit::window::CursorIcon::Default;
+        use winit::window::CursorIcon;
+        if self.room.running || self.room.plot_kind != PlotKind::RoomResponse {
+            return CursorIcon::Default;
         }
-        let plot = self.room.graph;
-        let edge = self
-            .room_recipe()
-            .regions
-            .iter()
-            .flat_map(|r| [r.band.low, r.band.high])
-            .any(|f| {
-                ((plot.x0 + (f / 20.0).log10() / 3.0 * plot.width()) - self.cursor.x).abs() < 7.0
-            });
-        if edge {
-            winit::window::CursorIcon::EwResize
-        } else {
-            winit::window::CursorIcon::Crosshair
+        match self.dragging {
+            Some(super::Drag::Room(drag)) => Some(drag),
+            _ => self.room_handle(),
         }
+        .map_or(CursorIcon::Default, |handle| match handle {
+            Drag::Crossover | Drag::TransitionEdge => CursorIcon::EwResize,
+            Drag::Knee { .. } | Drag::Knot(_) => CursorIcon::Move,
+        })
     }
     pub(super) fn room_choices(&self, field: ChoiceField) -> Vec<(String, super::Action, bool)> {
         let prefs = &self.settings.room;
@@ -2673,10 +2764,10 @@ impl App {
     }
     pub(super) fn room_bar_from_fraction(&mut self, bar: Bar, fraction: f64) {
         let parameter = bar.parameter();
-        let maximum = bar.maximum(&self.settings.room.recipe, self.room.selected_region);
+        let maximum = bar.maximum();
         let step = match bar {
-            Bar::Effort | Bar::RegionEffort => 1.0,
-            _ => 1.0 / 24.0,
+            Bar::Effort => 1.0,
+            Bar::BassSmoothing | Bar::TrebleSmoothing => 1.0 / 24.0,
         };
         let value = ((fraction.clamp(0.0, 1.0) * maximum / step).round() * step).min(maximum);
         if let Err(error) = self.room_number(parameter, value) {
@@ -2689,10 +2780,9 @@ impl App {
     pub(super) fn reset_room_bar(&mut self, bar: Bar) {
         let defaults = correction::Recipe::default();
         let value = match bar {
-            Bar::Effort => defaults.global_effort * 100.0,
-            Bar::RegionEffort => 100.0,
-            Bar::RegionSmoothing | Bar::BassSmoothing => defaults.smoothing_bass,
-            Bar::TrebleSmoothing => defaults.smoothing_treble,
+            Bar::Effort => 100.0,
+            Bar::BassSmoothing => defaults.smoothing.bass_octaves,
+            Bar::TrebleSmoothing => defaults.smoothing.treble_octaves,
         };
         if let Err(error) = self.room_number(bar.parameter(), value) {
             self.message = error.to_string();
@@ -2725,6 +2815,10 @@ impl App {
             Stage::Correction => geometry.body,
             Stage::Setup | Stage::Measure => geometry.after_route(),
         };
+        let smoothing = self.room_recipe().smoothing;
+        if let Some(data) = &mut self.room.plot_data {
+            data.refresh_smoothed(smoothing, self.room.point_view);
+        }
         let mut preferences = self.settings.room.clone();
         preferences.recipe = self.room_recipe().clone();
         if self.room.running
@@ -2967,7 +3061,7 @@ impl App {
             parameters: &parameters,
             measurements: &self.settings.measurements,
         };
-        let (height, graph) = match self.room.stage {
+        let (height, graph, scrollport) = match self.room.stage {
             Stage::Setup => (
                 draw_setup(
                     &mut p,
@@ -2978,38 +3072,60 @@ impl App {
                     self.peaks.0,
                 ),
                 Rect::ZERO,
-            ),
-            Stage::Measure => draw_measurement(
-                &mut p,
                 content,
-                origin,
-                &view,
-                &mut self.text_focus,
-                self.peaks.0,
             ),
-            Stage::Correction => draw_correction(&mut p, content, origin, &view, &status),
+            Stage::Measure => {
+                let (height, graph) = draw_measurement(
+                    &mut p,
+                    content,
+                    origin,
+                    &view,
+                    &mut self.text_focus,
+                    self.peaks.0,
+                );
+                (height, graph, content)
+            }
+            Stage::Correction => {
+                let [graph_column, sidebar] = correction_columns(content);
+                let plot = draw_correction(&mut p, graph_column, &view, &status);
+                let height = draw_correction_settings(
+                    &mut p,
+                    sidebar,
+                    sidebar.y0 - scroll,
+                    &view,
+                    &mut self.text_focus,
+                );
+                (height, plot, sidebar)
+            }
         };
         self.room.graph = graph;
-        if let Some(super::Drag::Room(Drag::Create { start, current })) = self.dragging {
-            let rect = Rect::new(start.min(current), graph.y0, start.max(current), graph.y1)
-                .intersect(graph);
-            p.rect(rect, opacity(colors.basic[5], 0.1));
-            p.outline(rect, 0.0, 1.0, colors.basic[5]);
-        }
         p.scene.pop_layer();
         for (bounds, _) in &mut p.hits[start_hits..] {
             *bounds = bounds.intersect(content);
         }
         if self.room.dialog.is_none() {
-            self.room.settings_bounds = content;
+            self.room.settings_bounds = scrollport;
             self.room.settings_height = height;
-            self.room.settings_scroll = scroll.clamp(0.0, (height - content.height()).max(0.0));
-            let scrollport = Rect::new(content.x0, content.y0, size.width - 4.0, content.y1);
+            self.room.settings_scroll = scroll.clamp(0.0, (height - scrollport.height()).max(0.0));
+            let scrollport = Rect::new(
+                scrollport.x0,
+                scrollport.y0,
+                size.width - 4.0,
+                scrollport.y1,
+            );
             if let Some(bar) = Scrollbar::new(scrollport, height, self.room.settings_scroll) {
                 p.scrollbar(bar, super::Action::Scroll(ScrollSurface::RoomSettings, bar));
             }
         }
-        draw_workspace_actions(&mut p, center, &self.room, &preferences, self.job.is_some());
+        let listening = self.room.listening_to_candidate(self.active.hash);
+        draw_workspace_actions(
+            &mut p,
+            center,
+            &self.room,
+            &preferences,
+            self.job.is_some(),
+            listening,
+        );
         p.rect(Rect::new(0.0, bottom, size.width, size.height), colors.bg);
         p.text(
             &self.message,
@@ -3038,7 +3154,6 @@ impl App {
                         Dialog::Measurements => {
                             (224.0 + self.settings.measurements.len() as f64 * 48.0).min(620.0)
                         }
-                        _ => 620.0,
                     }),
                 ),
             );
@@ -3047,7 +3162,6 @@ impl App {
             let title = match dialog {
                 Dialog::Uncalibrated(_) => "Measure without microphone calibration?",
                 Dialog::Verification => "Measure result",
-                Dialog::Target => "Target and filter settings",
                 Dialog::Measurements => "Measurements",
                 Dialog::MeasurementName => "Save measurement source",
                 Dialog::PresetName => "Save correction preset",
@@ -3183,16 +3297,6 @@ impl App {
                         enabled,
                     );
                 }
-                Dialog::Target => trailing(
-                    "Export filter...",
-                    super::Action::Room(Action::ExportFilter),
-                    false,
-                    self.room
-                        .selected
-                        .map_or(self.room.candidate.is_some(), |id| {
-                            self.room.history[id.0].correction().is_some()
-                        }),
-                ),
                 Dialog::Measurements => trailing(
                     "Save measurement...",
                     super::Action::Room(Action::SaveMeasurement),
@@ -3224,8 +3328,12 @@ const ALL_PARAMETERS: &[Parameter] = &[
     Parameter::Low,
     Parameter::High,
     Parameter::Effort,
+    Parameter::LowFade,
+    Parameter::HighFade,
     Parameter::BassSmoothing,
     Parameter::TrebleSmoothing,
+    Parameter::Crossover,
+    Parameter::Transition,
     Parameter::Boost,
     Parameter::Cut,
     Parameter::Offset,
@@ -3238,8 +3346,6 @@ const ALL_PARAMETERS: &[Parameter] = &[
     Parameter::MoveSeconds,
     Parameter::ExcitationLow,
     Parameter::ExcitationHigh,
-    Parameter::RegionEffort,
-    Parameter::RegionSmoothing,
     Parameter::Tilt,
     Parameter::Bass,
     Parameter::MidGain,
@@ -3379,6 +3485,31 @@ impl Form {
             super::Action::Room(action),
             self.enabled,
         );
+        self.y += ROW;
+    }
+    fn chips<'a>(
+        &mut self,
+        p: &mut Painter<'_, super::Action>,
+        chips: impl Iterator<Item = (&'a str, Action, bool)>,
+    ) {
+        let mut x = self.bounds.x0;
+        for (label, action, selected) in chips {
+            let width = p.advance(label, Face::Label).ceil() + INSET;
+            if x > self.bounds.x0 && x + width > self.bounds.x1 {
+                x = self.bounds.x0;
+                self.y += ROW;
+            }
+            x =
+                p.chip(
+                    x,
+                    self.y,
+                    label,
+                    super::Action::Room(action),
+                    selected,
+                    self.enabled,
+                )
+                .x1 + GAP;
+        }
         self.y += ROW;
     }
     fn section(&mut self, p: &mut Painter<'_, super::Action>, title: &str, icon: Icon) {
@@ -3935,7 +4066,6 @@ fn draw_settings(
     view: &SettingsView<'_>,
     focus: &mut Option<TextFocus>,
 ) -> f64 {
-    let prefs = view.preferences;
     let w = view.workspace;
     let mut f = Form::new(bounds, top, !w.running);
     match w.dialog.expect("dialog settings") {
@@ -3946,80 +4076,6 @@ fn draw_settings(
         Dialog::Verification => {
             f.note(p, "Measure the selected correction once. Keep the microphone at the reference listening position and use the same speaker volume and microphone gain.");
             f.note(p, "Verification records the actual response without changing the filter. Checking all positions guides you through the saved listening area.");
-        }
-        Dialog::Target => {
-            f.section(p, "Target level and gain", Icon::SlidersHorizontal);
-            f.note(p, &format!("Room target: {}", prefs.recipe.target.label()));
-            if prefs.recipe.target.parameters().is_some() {
-                for parameter in [
-                    Parameter::Tilt,
-                    Parameter::Bass,
-                    Parameter::MidGain,
-                    Parameter::MidCenter,
-                    Parameter::MidWidth,
-                ] {
-                    f.number(p, view, parameter, focus);
-                }
-            }
-            f.button(p, "Import acoustic target...", Action::ImportTarget);
-            f.toggle(
-                p,
-                "Fit one common L/R target level",
-                Action::AutoLevel,
-                matches!(
-                    prefs.recipe.target_level,
-                    correction::TargetLevel::Automatic
-                ),
-            );
-            let offset = w.plot_data.as_ref().map_or(0.0, |d| d.offset);
-            f.note(
-                p,
-                &format!("Fitted target offset {offset:+.2} dB / shared across both speakers."),
-            );
-            if matches!(prefs.recipe.target_level, correction::TargetLevel::Fixed(_)) {
-                f.number(p, view, Parameter::Offset, focus);
-            }
-            for (label, action, parameter, limit) in [
-                (
-                    "Limit boost",
-                    Action::BoostLimit,
-                    Parameter::Boost,
-                    prefs.recipe.maximum_boost_db,
-                ),
-                (
-                    "Limit cut",
-                    Action::CutLimit,
-                    Parameter::Cut,
-                    prefs.recipe.maximum_cut_db,
-                ),
-            ] {
-                f.toggle(p, label, action, limit.is_some());
-                if limit.is_some() {
-                    f.number(p, view, parameter, focus);
-                }
-            }
-            f.section(p, "Correction range", Icon::Waveform);
-            for parameter in [Parameter::Low, Parameter::High] {
-                f.number(p, view, parameter, focus);
-            }
-            f.note(
-    p,
-    "Correction follows the requested frequency range, smoothing, effort and enabled gain limits.",
-);
-            f.section(p, "Default filter smoothing", Icon::SlidersHorizontal);
-            draw_bar(p, f.row(), Bar::BassSmoothing, view);
-            f.y += 32.0;
-            draw_bar(p, f.row(), Bar::TrebleSmoothing, view);
-            f.y += 32.0;
-            if f.fold(p, w, Section::FilterLimits, "Advanced filter settings") {
-                f.dropdown(
-                    p,
-                    "Speaker alignment",
-                    alignment_label(prefs.recipe.alignment),
-                    ChoiceField::Alignment,
-                );
-                f.button(p, "Restore previous correction", Action::RestorePrevious);
-            }
         }
         Dialog::Measurements => {
             f.note(
@@ -4086,15 +4142,10 @@ fn draw_settings(
 fn stop_label(reason: workflow::StopReason) -> &'static str {
     match reason {
         workflow::StopReason::Prepared => "Candidate prepared / verification needed",
-        workflow::StopReason::AlreadyWithinTarget => "Baseline already within target",
-        workflow::StopReason::NoTonalCorrection => "No tonal correction requested",
         workflow::StopReason::ProcessedCorrectionVerified => "Processed correction verified",
-        workflow::StopReason::RequestedGoalReached => "Requested goal reached",
         workflow::StopReason::ImprovedLimitsReached => "Improved / correction limits reached",
         workflow::StopReason::NoMeasurableImprovement => "No measurable improvement",
         workflow::StopReason::TimeLimit => "Time budget reached",
-        workflow::StopReason::AttemptLimit => "Attempt limit reached",
-        workflow::StopReason::MeasurementUnreliable => "Insufficient evidence for verification",
         workflow::StopReason::Stopped => "Stopped",
     }
 }
@@ -4160,7 +4211,6 @@ fn band_label(band: measurement::Band) -> String {
 fn scope_label(scope: &Scope) -> String {
     match scope {
         Scope::Prediction { band } => format!("Unverified / {}", band_label(*band)),
-        Scope::Targeted { band, .. } => format!("Targeted only / {}", band_label(*band)),
         Scope::ReferenceFull { trusted, .. } => {
             format!("Reference measured / {}", band_label(*trusted))
         }
@@ -4222,21 +4272,370 @@ fn parameter_value(view: &SettingsView<'_>, parameter: Parameter) -> f64 {
 fn draw_bar(p: &mut Painter<'_, super::Action>, bounds: Rect, bar: Bar, view: &SettingsView<'_>) {
     let value = parameter_value(view, bar.parameter());
     let text = match bar {
-        Bar::Effort | Bar::RegionEffort => format!("{value:.0} %"),
-        _ if value == 0.0 => "Off".into(),
-        _ => format!("{value:.2} oct"),
+        Bar::Effort => format!("{value:.0} %"),
+        Bar::BassSmoothing | Bar::TrebleSmoothing => octave_label(value),
     };
     let start = p.hits.len();
     p.value_bar(
         bounds,
         bar.label(),
         &text,
-        value / bar.maximum(&view.preferences.recipe, view.workspace.selected_region),
+        value / bar.maximum(),
         super::Action::ValueBar(ValueBar::Room(bar)),
     );
     if view.workspace.running {
         p.hits.truncate(start);
         p.rect(bounds, opacity(p.colors.body, 0.4));
+    }
+}
+/// Octave widths read as the familiar 1/N fractions where they are one.
+fn octave_label(octaves: f64) -> String {
+    if octaves == 0.0 {
+        return "Off".into();
+    }
+    let denominator = (1.0 / octaves).round();
+    if (1.0..=48.0).contains(&denominator) && (1.0 / denominator - octaves).abs() < 1e-6 {
+        if denominator == 1.0 {
+            "1 oct".into()
+        } else {
+            format!("1/{denominator:.0} oct")
+        }
+    } else {
+        format!("{octaves:.2} oct")
+    }
+}
+/// Width of the correction settings column beside the graph.
+const SIDEBAR_WIDTH: f64 = 320.0;
+/// Graph column and settings sidebar of the correction stage.
+fn correction_columns(content: Rect) -> [Rect; 2] {
+    let sidebar = Rect::new(
+        content.x1 - SIDEBAR_WIDTH,
+        content.y0,
+        content.x1,
+        content.y1,
+    );
+    [
+        Rect::new(content.x0, content.y0, sidebar.x0 - INSET, content.y1),
+        sidebar,
+    ]
+}
+fn draw_correction(
+    p: &mut Painter<'_, super::Action>,
+    bounds: Rect,
+    view: &SettingsView<'_>,
+    status: &str,
+) -> Rect {
+    let w = view.workspace;
+    let enabled = !w.running;
+    let selected = w.selected.is_some();
+    heading(
+        p,
+        bounds,
+        bounds.y0 - 8.0,
+        &format!("Correction / {}", w.name),
+        "",
+        Some((
+            "Save preset...",
+            super::Action::Room(if selected {
+                Action::SavePass
+            } else {
+                Action::SaveCandidate
+            }),
+            enabled && (selected || w.candidate.is_some() && !view.preparing),
+        )),
+    );
+    let mut y = bounds.y0 + CONTROL + INSET;
+    if w.running {
+        draw_run_banner(
+            p,
+            Rect::new(bounds.x0, y, bounds.x1, y + 76.0),
+            w,
+            view.preferences,
+            status,
+        );
+        y += 88.0;
+    }
+    let spatial_view = w.source.as_ref().is_some_and(|s| s.points.len() > 1);
+    let view_controls = spatial_view || w.plot_kind == PlotKind::CorrectionFir || selected;
+    let below = layout::GraphLayout::ROOM_CHROME_HEIGHT + if view_controls { 36.0 } else { 0.0 };
+    let graph_height = (bounds.y1 - y - below).max(200.0);
+    let plot = draw_plot(p, bounds, y, graph_height, view);
+    y += graph_height + layout::GraphLayout::ROOM_CHROME_HEIGHT;
+    let mut x = bounds.x0;
+    if spatial_view {
+        x =
+            p.button(
+                x,
+                y,
+                &w.point_view
+                    .map_or_else(|| "Spatial mean".into(), |i| format!("Point {}", i + 1)),
+                super::Action::Room(Action::PointView),
+                true,
+            )
+            .x1 + GAP;
+    }
+    if w.plot_kind == PlotKind::CorrectionFir {
+        p.toggle(
+            Rect::new(x, y, (x + 230.0).min(bounds.x1), y + 24.0),
+            "Unsmoothed request",
+            super::Action::Room(Action::Unsmoothed),
+            w.show_unsmoothed,
+            true,
+        );
+        x += 238.0;
+    }
+    if selected {
+        p.toggle(
+            Rect::new(x, y, (x + 210.0).min(bounds.x1), y + 24.0),
+            "Compare parent",
+            super::Action::Room(Action::ParentComparison),
+            w.compare_parent,
+            true,
+        );
+    }
+    plot
+}
+/// Target, smoothing, limits, effort and range beside the graph. Returns the content height.
+fn draw_correction_settings(
+    p: &mut Painter<'_, super::Action>,
+    bounds: Rect,
+    top: f64,
+    view: &SettingsView<'_>,
+    focus: &mut Option<TextFocus>,
+) -> f64 {
+    let w = view.workspace;
+    let recipe = &view.preferences.recipe;
+    let mut f = Form::new(bounds, top, !w.running);
+    f.section(p, "Target", Icon::SlidersHorizontal);
+    f.chips(
+        p,
+        TargetPreset::ALL
+            .into_iter()
+            .map(|preset| {
+                (
+                    preset.label(),
+                    Action::SetTarget(preset),
+                    preset.selects(&recipe.target),
+                )
+            })
+            .chain(std::iter::once((
+                "Import...",
+                Action::ImportTarget,
+                matches!(recipe.target, correction::Target::Custom(_)),
+            ))),
+    );
+    if let correction::Target::Parametric(_) = recipe.target {
+        for parameter in [
+            Parameter::Tilt,
+            Parameter::Bass,
+            Parameter::MidGain,
+            Parameter::MidCenter,
+            Parameter::MidWidth,
+        ] {
+            f.number(p, view, parameter, focus);
+        }
+    }
+    let automatic = matches!(recipe.target_level, correction::TargetLevel::Automatic);
+    f.toggle(p, "Fit common L/R level", Action::AutoLevel, automatic);
+    if automatic {
+        let offset = w.plot_data.as_ref().map_or(0.0, |d| d.offset);
+        f.note(p, &format!("Fitted target offset {offset:+.1} dB"));
+    } else {
+        f.number(p, view, Parameter::Offset, focus);
+    }
+
+    f.section(p, "Smoothing", Icon::Waveform);
+    for bar in [Bar::BassSmoothing, Bar::TrebleSmoothing] {
+        draw_bar(p, f.row(), bar, view);
+        f.y += ROW;
+    }
+    f.number(p, view, Parameter::Crossover, focus);
+    f.number(p, view, Parameter::Transition, focus);
+
+    f.section(p, "Limits", Icon::SlidersHorizontal);
+    for (label, action, parameter, limit) in [
+        (
+            "Limit boost",
+            Action::BoostLimit,
+            Parameter::Boost,
+            recipe.maximum_boost_db,
+        ),
+        (
+            "Limit cut",
+            Action::CutLimit,
+            Parameter::Cut,
+            recipe.maximum_cut_db,
+        ),
+    ] {
+        f.toggle(p, label, action, limit.is_some());
+        if limit.is_some() {
+            f.number(p, view, parameter, focus);
+        }
+    }
+
+    f.section(p, "Effort", Icon::SlidersHorizontal);
+    let easy = matches!(recipe.effort, correction::Effort::Easy { .. });
+    f.chips(
+        p,
+        [
+            ("Easy", Action::SetEffortMode(EffortMode::Easy), easy),
+            (
+                "Advanced",
+                Action::SetEffortMode(EffortMode::Advanced),
+                !easy,
+            ),
+        ]
+        .into_iter(),
+    );
+    if easy {
+        draw_bar(p, f.row(), Bar::Effort, view);
+        f.y += ROW;
+        f.number(p, view, Parameter::LowFade, focus);
+        f.number(p, view, Parameter::HighFade, focus);
+    } else {
+        f.note(
+            p,
+            "Drag knots on the graph. Click the line to add a knot; Alt-click a knot to remove it.",
+        );
+    }
+
+    f.section(p, "Correction range", Icon::Waveform);
+    f.number(p, view, Parameter::Low, focus);
+    f.number(p, view, Parameter::High, focus);
+
+    f.y += GAP;
+    if f.fold(p, w, Section::Advanced, "Advanced filter settings") {
+        f.dropdown(
+            p,
+            "Speaker alignment",
+            alignment_label(recipe.alignment),
+            ChoiceField::Alignment,
+        );
+        f.button(p, "Restore previous correction", Action::RestorePrevious);
+        let exportable = w.selected.map_or(w.candidate.is_some(), |id| {
+            w.history[id.0].correction().is_some()
+        });
+        if exportable {
+            f.button(p, "Export filter...", Action::ExportFilter);
+        }
+    }
+    let mut details = Form::new(bounds, f.y, true);
+    if details.fold(p, w, Section::Diagnostics, "Measurement details") {
+        draw_diagnostics(p, &mut details, w);
+    }
+    details.y - top + INSET
+}
+fn draw_diagnostics(p: &mut Painter<'_, super::Action>, f: &mut Form, w: &Workspace) {
+    let Some(pass) = w
+        .selected
+        .and_then(|id| w.history.get(id.0))
+        .or_else(|| {
+            w.history
+                .iter()
+                .rev()
+                .find(|p| p.correction() == w.candidate)
+        })
+        .or_else(|| w.history.last())
+    else {
+        return;
+    };
+    let metrics = &pass.metrics;
+    let headroom = w.plot_data.as_ref().map_or_else(
+        || "--".into(),
+        |d| format!("{:.1} dB", -d.analysis.headroom_db),
+    );
+    let verification = if pass.fully_verified() {
+        match pass.scope {
+            Scope::ReferenceFull { .. } => "Reference verified",
+            Scope::SpatialFull { .. } => "Positions verified",
+            _ => unreachable!("verified pass has a full measurement scope"),
+        }
+    } else {
+        "Unverified"
+    };
+    for (label, value) in [
+        ("Processed goal RMS", format!("{:.2} dB", metrics.score())),
+        ("Required headroom", headroom),
+        ("Verification", verification.into()),
+    ] {
+        let row = f.row();
+        p.text(label, row, Face::Label, Align::Start, p.colors.secondary);
+        p.text(&value, row, Face::Value, Align::End, p.colors.fg);
+        f.y += ROW;
+    }
+    f.note(
+        p,
+        &format!(
+            "Processed goal L/R {:.2}/{:.2} dB RMS{}",
+            metrics.processed_rms_db[0],
+            metrics.processed_rms_db[1],
+            pass.parent.map_or_else(String::new, |id| {
+                let parent = &w.history[id.0];
+                if comparable_parent(pass, parent) {
+                    format!(
+                        " / parent {}: {:.2} dB RMS / change {:+.2} dB",
+                        id.0,
+                        parent.metrics.score(),
+                        metrics.score() - parent.metrics.score()
+                    )
+                } else {
+                    format!(
+                        " / parent {} uses a different objective or verification scope; scores are not comparable",
+                        id.0
+                    )
+                }
+            })
+        ),
+    );
+    f.note(
+        p,
+        &format!(
+            "{} / Original target L/R {:.2}/{:.2} dB / requested {:.2}/{:.2} dB / coverage {:.0}/{:.0}% / uncertainty {:.2} dB",
+            scope_label(&pass.scope),
+            metrics.target_rms_db[0],
+            metrics.target_rms_db[1],
+            metrics.requested_rms_db[0],
+            metrics.requested_rms_db[1],
+            metrics.coverage[0] * 100.0,
+            metrics.coverage[1] * 100.0,
+            metrics.decision_uncertainty()
+        ),
+    );
+    f.note(
+        p,
+        &format!(
+            "Observed repeat difference {:.2} dB / noise uncertainty {:.2} dB. Outside-fit difference {:.2} dB / arrival difference {:.2} ms.",
+            metrics.repeatability_db,
+            metrics.noise_uncertainty_db,
+            metrics.unexpected_outside_fit_db,
+            metrics.alignment_error_ms,
+        ),
+    );
+    if pass.decision == Decision::Provisional {
+        f.note(
+            p,
+            "Incomplete verification. This measurement is retained as evidence and does not certify the complete correction objective.",
+        );
+    }
+    if let Some(source) = &w.source {
+        let position = w.point_view.unwrap_or(source.plan.layout.reference);
+        if let Some(warning) = source.points[position].noise.quality_warning() {
+            f.note(
+                p,
+                &format!("{}: {warning}", source.plan.layout.positions[position].name),
+            );
+        }
+    }
+    if let Some(data) = &w.plot_data {
+        f.note(
+            p,
+            &format!(
+                "{} Hz / FIR support {:.1} ms / minimum phase / convolution buffering {:.2} ms. Shaded bands: outside the correction range.",
+                data.rate.hz(),
+                data.recipe.taps.frames() as f64 / f64::from(data.rate.hz()) * 1000.0,
+                128000.0 / f64::from(data.rate.hz())
+            ),
+        );
     }
 }
 fn draw_plot(
@@ -4301,7 +4700,12 @@ fn draw_plot(
             p.colors.secondary,
         );
     } else {
-        for trace in Trace::ALL {
+        let data = w.plot_data.as_ref();
+        for trace in Trace::ALL.into_iter().filter(|trace| match trace {
+            Trace::Spread => data.is_some_and(|d| d.points.len() > 1),
+            Trace::Verified => data.is_some_and(|d| d.traces(w.point_view).measured.is_some()),
+            _ => true,
+        }) {
             let width = p.advance(trace.label(), Face::Small).ceil() + 21.0;
             let visible = w.traces.contains(&trace);
             let ink = opacity(trace.color(p.colors), if visible { 1.0 } else { 0.35 });
@@ -4321,359 +4725,6 @@ fn draw_plot(
         }
     }
     plot
-}
-fn draw_correction(
-    p: &mut Painter<'_, super::Action>,
-    bounds: Rect,
-    top: f64,
-    view: &SettingsView<'_>,
-    status: &str,
-) -> (f64, Rect) {
-    let w = view.workspace;
-    let prefs = view.preferences;
-    let enabled = !w.running;
-    let selected = w.selected.and_then(|id| w.history.get(id.0));
-    let pass = selected
-        .or_else(|| {
-            w.history
-                .iter()
-                .rev()
-                .find(|p| p.correction() == w.candidate)
-        })
-        .or_else(|| w.history.last());
-    let title = format!("Correction / {}", w.name);
-    heading(
-        p,
-        bounds,
-        top,
-        &title,
-        "",
-        Some((
-            "Save preset...",
-            super::Action::Room(if selected.is_some() {
-                Action::SavePass
-            } else {
-                Action::SaveCandidate
-            }),
-            enabled && (selected.is_some() || w.candidate.is_some() && !view.preparing),
-        )),
-    );
-    let mut y = top + CONTROL + INSET + GAP;
-    if w.running {
-        draw_run_banner(
-            p,
-            Rect::new(bounds.x0, y, bounds.x1, y + 76.0),
-            w,
-            prefs,
-            status,
-        );
-        y += 88.0;
-    } else {
-        p.text(
-            "Target",
-            Rect::new(bounds.x0, y, bounds.x0 + 62.0, y + 24.0),
-            Face::Small,
-            Align::Start,
-            p.colors.secondary,
-        );
-        let mut x = bounds.x0 + 48.0;
-        for preset in [
-            TargetPreset::Gentle,
-            TargetPreset::Natural,
-            TargetPreset::Warm,
-            TargetPreset::Flat,
-        ] {
-            let target = preset.target();
-            x =
-                p.chip(
-                    x,
-                    y,
-                    preset.label(),
-                    super::Action::Room(Action::SetTarget(preset)),
-                    std::mem::discriminant(&target) == std::mem::discriminant(&prefs.recipe.target),
-                    enabled,
-                )
-                .x1 + GAP;
-        }
-        p.ghost_icon(
-            Rect::new(bounds.x1 - CONTROL, y, bounds.x1, y + CONTROL),
-            Icon::SlidersHorizontal,
-            super::Action::Room(Action::Dialog(Some(Dialog::Target))),
-            true,
-        );
-        let offset = w.plot_data.as_ref().map_or(0.0, |d| d.offset);
-        let end = p
-            .chip(
-                x,
-                y,
-                &format!(
-                    "{} {offset:+.1} dB",
-                    if matches!(
-                        prefs.recipe.target_level,
-                        correction::TargetLevel::Automatic
-                    ) {
-                        "Auto level"
-                    } else {
-                        "Manual level"
-                    }
-                ),
-                super::Action::Room(Action::AutoLevel),
-                false,
-                enabled,
-            )
-            .x1;
-        p.text(
-            &band_label(prefs.recipe.range),
-            Rect::new(end + GAP, y, bounds.x1 - 48.0, y + 24.0),
-            Face::Small,
-            Align::End,
-            p.colors.secondary,
-        );
-        y += 36.0;
-    }
-    let spatial_view = w.source.as_ref().is_some_and(|s| s.points.len() > 1);
-    let view_controls =
-        spatial_view || w.plot_kind == PlotKind::CorrectionFir || w.selected.is_some();
-    let header_height = if w.running { 88.0 } else { 36.0 };
-    let reserved = CONTROL
-        + INSET
-        + GAP
-        + header_height
-        + layout::GraphLayout::ROOM_CHROME_HEIGHT
-        + INSET
-        + (if view_controls { 36.0 } else { 0.0 })
-        + 112.0;
-    let graph_height = (bounds.height() - reserved).max(200.0);
-    let plot = draw_plot(p, bounds, y, graph_height, view);
-    y += graph_height + layout::GraphLayout::ROOM_CHROME_HEIGHT + INSET;
-    let mut x = bounds.x0;
-    if spatial_view {
-        x =
-            p.button(
-                x,
-                y,
-                &w.point_view
-                    .map_or_else(|| "Spatial mean".into(), |i| format!("Point {}", i + 1)),
-                super::Action::Room(Action::PointView),
-                true,
-            )
-            .x1 + GAP;
-    }
-    if w.plot_kind == PlotKind::CorrectionFir {
-        p.toggle(
-            Rect::new(x, y, (x + 230.0).min(bounds.x1), y + 24.0),
-            "Unsmoothed request",
-            super::Action::Room(Action::Unsmoothed),
-            w.show_unsmoothed,
-            true,
-        );
-    }
-    if w.selected.is_some() {
-        if w.plot_kind == PlotKind::CorrectionFir {
-            x += 238.0;
-        }
-        p.toggle(
-            Rect::new(x, y, (x + 210.0).min(bounds.x1), y + 24.0),
-            "Compare parent",
-            super::Action::Room(Action::ParentComparison),
-            w.compare_parent,
-            w.selected.is_some(),
-        );
-    }
-    if view_controls {
-        y += 36.0;
-    }
-    draw_bar(
-        p,
-        Rect::new(bounds.x0, y, bounds.x1, y + 24.0),
-        Bar::Effort,
-        view,
-    );
-    y += 36.0;
-    let mut sections = Form::new(Rect::new(bounds.x0, y, bounds.x1, bounds.y1), y, enabled);
-    let regions_open = sections.fold(p, w, Section::Regions, "Regional adjustments");
-    y = sections.y;
-    if regions_open {
-        p.text(
-            "Linked L/R",
-            Rect::new(bounds.x0, y, bounds.x1 - 2.0 * (CONTROL + GAP), y + 24.0),
-            Face::Small,
-            Align::End,
-            p.colors.secondary,
-        );
-        p.ghost_icon(
-            Rect::new(
-                bounds.x1 - 2.0 * CONTROL - GAP,
-                y,
-                bounds.x1 - CONTROL - GAP,
-                y + 24.0,
-            ),
-            Icon::X,
-            super::Action::Room(Action::RemoveRegion),
-            enabled && w.selected_region.is_some(),
-        );
-        p.ghost_icon(
-            Rect::new(bounds.x1 - CONTROL, y, bounds.x1, y + CONTROL),
-            Icon::ArrowsClockwise,
-            super::Action::Room(Action::ResetRegions),
-            enabled && !prefs.recipe.regions.is_empty(),
-        );
-        y += 32.0;
-        let mut x = bounds.x0;
-        for (i, r) in prefs.recipe.regions.iter().enumerate() {
-            let label = band_label(r.band);
-            let width = p.advance(&label, Face::Label).ceil() + INSET;
-            if x + width > bounds.x1 {
-                x = bounds.x0;
-                y += 32.0;
-            }
-            x =
-                p.chip(
-                    x,
-                    y,
-                    &label,
-                    super::Action::Room(Action::SelectRegion(i)),
-                    w.selected_region == Some(i),
-                    enabled,
-                )
-                .x1 + GAP;
-        }
-        if x + 82.0 > bounds.x1 {
-            x = bounds.x0;
-            y += 32.0;
-        }
-        p.button(
-            x,
-            y,
-            "+ Region",
-            super::Action::Room(Action::AddRegion),
-            enabled,
-        );
-        y += 32.0;
-        if w.selected_region
-            .is_some_and(|i| i < prefs.recipe.regions.len())
-        {
-            let mid = bounds.center().x;
-            draw_bar(
-                p,
-                Rect::new(bounds.x0, y, mid - GAP, y + 24.0),
-                Bar::RegionEffort,
-                view,
-            );
-            draw_bar(
-                p,
-                Rect::new(mid + GAP, y, bounds.x1, y + 24.0),
-                Bar::RegionSmoothing,
-                view,
-            );
-            y += 36.0;
-        } else {
-            p.text(
-                "No region selected. Drag across the graph to add an override.",
-                Rect::new(bounds.x0, y, bounds.x1, y + 24.0),
-                Face::Small,
-                Align::Start,
-                p.colors.secondary,
-            );
-            y += 24.0;
-        }
-    }
-    let mut sections = Form::new(Rect::new(bounds.x0, y, bounds.x1, bounds.y1), y, true);
-    let diagnostics_open = sections.fold(p, w, Section::Diagnostics, "Measurement details");
-    y = sections.y;
-    if diagnostics_open && let Some(pass) = pass {
-        p.line((bounds.x0, y), (bounds.x1, y), p.colors.pane(), RULE);
-        y += 10.0;
-        let metrics = &pass.metrics;
-        let columns = 3;
-        let width = bounds.width() / columns as f64;
-        let headroom = w.plot_data.as_ref().map_or_else(
-            || "--".into(),
-            |d| format!("{:.1} dB", -d.analysis.headroom_db),
-        );
-        let values: [(String, &str); 3] = [
-            (format!("{:.2} dB", metrics.score()), "Processed goal RMS"),
-            (headroom, "Required headroom"),
-            (
-                if pass.fully_verified() {
-                    match pass.scope {
-                        Scope::ReferenceFull { .. } => "Reference verified".into(),
-                        Scope::SpatialFull { .. } => "Positions verified".into(),
-                        _ => unreachable!("verified pass has a full measurement scope"),
-                    }
-                } else {
-                    "Unverified".into()
-                },
-                "Verification",
-            ),
-        ];
-        for (i, (value, label)) in values.iter().enumerate() {
-            let x = bounds.x0 + (i % columns) as f64 * width;
-            let y = y + (i / columns) as f64 * 52.0;
-            if i % columns > 0 {
-                p.line((x - 8.0, y), (x - 8.0, y + 44.0), p.colors.pane(), RULE);
-            }
-            p.text(
-                value,
-                Rect::new(x, y, x + width - 12.0, y + 24.0),
-                Face::Value,
-                Align::Start,
-                if i == 0 {
-                    p.colors.basic[2]
-                } else {
-                    p.colors.fg
-                },
-            );
-            p.text(
-                label,
-                Rect::new(x, y + 25.0, x + width - 12.0, y + 43.0),
-                Face::Small,
-                Align::Start,
-                p.colors.secondary,
-            );
-        }
-        y += 54.0;
-        let mut f = Form::new(Rect::new(bounds.x0, y, bounds.x1, bounds.y1), y, false);
-        f.note(
-            p,
-            &format!(
-                "Processed goal L/R {:.2}/{:.2} dB RMS{}",
-                metrics.processed_rms_db[0],
-                metrics.processed_rms_db[1],
-                pass.parent.map_or_else(String::new, |id| {
-                    let parent = &w.history[id.0];
-                    if comparable_parent(pass, parent) {
-                        format!(" / parent {}: {:.2} dB RMS / change {:+.2} dB", id.0, parent.metrics.score(), metrics.score() - parent.metrics.score())
-                    } else {
-                        format!(" / parent {} uses a different objective or verification scope; scores are not comparable", id.0)
-                    }
-                })
-            ),
-        );
-        f.note(p,&format!("{} / Original target L/R {:.2}/{:.2} dB / requested {:.2}/{:.2} dB / coverage {:.0}/{:.0}% / uncertainty {:.2} dB",scope_label(&pass.scope),metrics.target_rms_db[0],metrics.target_rms_db[1],metrics.requested_rms_db[0],metrics.requested_rms_db[1],metrics.coverage[0]*100.0,metrics.coverage[1]*100.0,metrics.decision_uncertainty()));
-        f.note(p, &format!(
-            "Observed repeat difference {:.2} dB / noise uncertainty {:.2} dB. Outside-fit difference {:.2} dB / arrival difference {:.2} ms.",
-            metrics.repeatability_db, metrics.noise_uncertainty_db,
-            metrics.unexpected_outside_fit_db, metrics.alignment_error_ms,
-        ));
-        if pass.decision == Decision::Provisional {
-            f.note(p, "Incomplete verification. This measurement is retained as evidence and does not certify the complete correction objective.");
-        }
-        if let Some(source) = &w.source {
-            let position = w.point_view.unwrap_or(source.plan.layout.reference);
-            if let Some(warning) = source.points[position].noise.quality_warning() {
-                f.note(
-                    p,
-                    &format!("{}: {warning}", source.plan.layout.positions[position].name),
-                );
-            }
-        }
-        if let Some(data) = &w.plot_data {
-            f.note(p,&format!("{} Hz / FIR support {:.1} ms / minimum phase / convolution buffering {:.2} ms. Shaded bands: outside the correction range.",data.rate.hz(),data.recipe.taps.frames() as f64/f64::from(data.rate.hz())*1000.0,128000.0/f64::from(data.rate.hz())));
-        }
-        y = f.y;
-    }
-    (y - top + INSET, plot)
 }
 fn draw_run_banner(
     p: &mut Painter<'_, super::Action>,
@@ -4827,6 +4878,7 @@ fn draw_workspace_actions(
     w: &Workspace,
     prefs: &measurement::Preferences,
     preparing: bool,
+    listening: bool,
 ) {
     let y = bounds.y1 - INSET - CONTROL;
     p.rect(
@@ -4856,13 +4908,16 @@ fn draw_workspace_actions(
                 "Place the microphone at the reference position".into(),
             ),
             Stage::Correction => (
-                "Listen",
+                if listening { "Listening" } else { "Listen" },
                 Action::Listen,
-                w.candidate.is_some() && w.selected.is_none() && !preparing,
-                if preparing {
-                    "Preparing correction..."
-                } else {
-                    "Compare with Bypass while listening"
+                !listening && w.candidate.is_some() && w.selected.is_none() && !preparing,
+                match (preparing, listening) {
+                    (true, true) => "Preparing correction / it plays as soon as it is ready",
+                    (true, false) => "Preparing correction...",
+                    (false, true) => {
+                        "Edits play as soon as they are prepared / compare with Bypass"
+                    }
+                    (false, false) => "Listen to hear edits as you make them",
                 }
                 .into(),
             ),
@@ -4915,6 +4970,127 @@ fn channel_curve(
     }
 }
 
+/// Graph overlay geometry shared by drawing and dragging: a smoothing strip along the
+/// top of the plot and effort mapped from 0 at the bottom to 1 under the strip.
+struct Overlay {
+    plot: Rect,
+    strip: Rect,
+}
+impl Overlay {
+    const STRIP: f64 = 22.0;
+    const MARGIN: f64 = 8.0;
+    fn new(plot: Rect) -> Self {
+        Self {
+            plot,
+            strip: Rect::new(plot.x0, plot.y0, plot.x1, plot.y0 + Self::STRIP),
+        }
+    }
+    fn x(&self, hz: f64) -> f64 {
+        self.plot.x0 + (hz / 20.0).log10() / 3.0 * self.plot.width()
+    }
+    fn top(&self) -> f64 {
+        self.strip.y1 + Self::MARGIN
+    }
+    fn bottom(&self) -> f64 {
+        self.plot.y1 - Self::MARGIN
+    }
+    fn y(&self, effort: f64) -> f64 {
+        self.bottom() - effort * (self.bottom() - self.top())
+    }
+    /// Effort under `y`, in whole percent.
+    fn effort(&self, y: f64) -> f64 {
+        (((self.bottom() - y) / (self.bottom() - self.top())).clamp(0.0, 1.0) * 100.0).round()
+            / 100.0
+    }
+    fn point(&self, hz: f64, effort: f64) -> vello::kurbo::Point {
+        vello::kurbo::Point::new(self.x(hz), self.y(effort))
+    }
+    /// A curve whose dB values the painter maps onto these screen heights.
+    fn screen_curve(&self, points: impl Iterator<Item = (f64, f64)>) -> Curve {
+        let (frequency, db) = points
+            .map(|(hz, y)| {
+                (
+                    hz as f32,
+                    (24.0 - (y - self.plot.y0) / self.plot.height() * 48.0) as f32,
+                )
+            })
+            .unzip();
+        Curve { frequency, db }
+    }
+}
+
+/// Vertical dB window fitted to the displayed response, in the painter's +/-24 frame.
+#[derive(Clone, Copy)]
+struct DbAxis {
+    center: f32,
+    span: f32,
+}
+impl DbAxis {
+    const FIXED: Self = Self {
+        center: 0.0,
+        span: 48.0,
+    };
+    fn fit<'a>(curves: impl Iterator<Item = &'a Curve>, range: measurement::Band) -> Self {
+        let (low, high) = curves
+            .flat_map(|c| c.frequency.iter().zip(&c.db))
+            .filter(|(hz, _)| range.contains(f64::from(**hz)))
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), (_, &db)| {
+                (lo.min(db), hi.max(db))
+            });
+        if !low.is_finite() {
+            return Self::FIXED;
+        }
+        Self {
+            center: ((low + high) / 12.0).round() * 6.0,
+            span: ((high - low + 12.0) / 24.0).ceil().max(2.0) * 24.0,
+        }
+    }
+    fn map(self, curve: &Curve) -> Curve {
+        Curve {
+            frequency: curve.frequency.clone(),
+            db: curve
+                .db
+                .iter()
+                .map(|db| (db - self.center) * 48.0 / self.span)
+                .collect(),
+        }
+    }
+    fn label(self, frame_db: f32) -> f32 {
+        self.center + frame_db * self.span / 48.0
+    }
+}
+
+/// Response traces smoothed with the recipe being edited, so smoothing edits show at once.
+struct Smoothed {
+    key: (correction::Smoothing, Option<usize>),
+    baseline: [Curve; 2],
+    predicted: [Curve; 2],
+    measured: Option<[Curve; 2]>,
+}
+impl PlotData {
+    fn traces(&self, point_view: Option<usize>) -> &ResponseTraces {
+        point_view.map_or(&self.spatial, |point| &self.points[point])
+    }
+    fn refresh_smoothed(&mut self, smoothing: correction::Smoothing, point_view: Option<usize>) {
+        let key = (smoothing, point_view);
+        if self.smoothed.as_ref().is_some_and(|s| s.key == key) {
+            return;
+        }
+        let traces = self.traces(point_view);
+        let smooth = |curves: &[Curve; 2]| {
+            curves
+                .each_ref()
+                .map(|c| correction::smoothed(c, smoothing))
+        };
+        self.smoothed = Some(Smoothed {
+            key,
+            baseline: smooth(&traces.baseline),
+            predicted: smooth(&traces.predicted),
+            measured: traces.measured.as_ref().map(|m| smooth(&m.curves)),
+        });
+    }
+}
+
 fn draw_graph(
     p: &mut Painter<'_, super::Action>,
     plot: Rect,
@@ -4923,30 +5099,40 @@ fn draw_graph(
 ) {
     let colors = p.colors;
     p.rect(plot, colors.bg);
-    let acquired = if workspace.plot_data.is_none() && workspace.plot_kind == PlotKind::RoomResponse
-    {
+    let overlay = Overlay::new(plot);
+    let x = |f: f64| overlay.x(f);
+    let channel_enabled = |c| {
+        matches!(
+            (workspace.channels, c),
+            (Channels::Both, _) | (Channels::Left, 0) | (Channels::Right, 1)
+        )
+    };
+    let response = workspace.plot_kind == PlotKind::RoomResponse;
+    let acquired = if workspace.plot_data.is_none() && response {
         workspace.source.as_ref().map(correction::aggregate)
     } else {
         None
     };
-    let raw_range = acquired.as_ref().map(|data| {
-        let low = data
-            .magnitude
-            .iter()
-            .flat_map(|c| c.db.iter())
-            .copied()
-            .fold(f32::INFINITY, f32::min);
-        let high = data
-            .magnitude
-            .iter()
-            .flat_map(|c| c.db.iter())
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let low = (low / 10.0).floor() * 10.0;
-        let high = (high / 10.0).ceil() * 10.0;
-        (low, (low + 48.0).max(high))
-    });
-    let x = |f: f64| plot.x0 + (f / 20.0).log10() / 3.0 * plot.width();
+    let relative = |curve: &Curve, offset: f32| Curve {
+        frequency: curve.frequency.clone(),
+        db: curve.db.iter().map(|v| v - offset).collect(),
+    };
+    let axis = match (&workspace.plot_data, &acquired) {
+        (Some(data), _) if response => {
+            let smoothed = data
+                .smoothed
+                .as_ref()
+                .expect("smoothed traces refreshed before drawing");
+            let shown: Vec<_> = (0..2)
+                .filter(|&c| channel_enabled(c))
+                .map(|c| relative(&smoothed.baseline[c], data.offset))
+                .chain(std::iter::once(relative(&data.target, data.offset)))
+                .collect();
+            DbAxis::fit(shown.iter(), recipe.range)
+        }
+        (None, Some(data)) => DbAxis::fit(data.magnitude.iter(), measurement::Band::default()),
+        _ => DbAxis::FIXED,
+    };
     for hz in [
         20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
     ] {
@@ -4969,15 +5155,11 @@ fn draw_graph(
             colors.secondary,
         );
     }
-    for db in [-24.0, -12.0, 0.0, 12.0, 24.0] {
-        let y = plot.y0 + (24.0 - db) / 48.0 * plot.height();
+    for db in [-24.0f32, -12.0, 0.0, 12.0, 24.0] {
+        let y = plot.y0 + f64::from(24.0 - db) / 48.0 * plot.height();
         p.line((plot.x0, y), (plot.x1, y), colors.ghost, 1.0);
         p.text(
-            &format!(
-                "{:+.0}",
-                raw_range.map_or(db as f32, |(low, high)| low
-                    + (db as f32 + 24.0) / 48.0 * (high - low))
-            ),
+            &format!("{:+.0}", axis.label(db)),
             Rect::new(plot.x0 - 34.0, y - 9.0, plot.x0 - 4.0, y + 9.0),
             Face::Value,
             Align::End,
@@ -4985,28 +5167,6 @@ fn draw_graph(
         );
     }
     p.hits.push((plot, super::Action::Room(Action::Graph)));
-    for (i, r) in recipe.regions.iter().enumerate() {
-        let rect = Rect::new(x(r.band.low), plot.y0, x(r.band.high), plot.y1);
-        let selected = !workspace.running && workspace.selected_region == Some(i);
-        let ink = if selected {
-            colors.basic[5]
-        } else {
-            colors.secondary
-        };
-        if selected {
-            p.rect(rect, opacity(ink, 0.09));
-        }
-        p.outline(rect, 0.0, if selected { 1.5 } else { 1.0 }, ink);
-        for (low, high) in [
-            (r.band.low, r.band.low * 2f64.powf(r.lower_fade)),
-            (r.band.high / 2f64.powf(r.upper_fade), r.band.high),
-        ] {
-            p.rect(
-                Rect::new(x(low), plot.y0, x(high), plot.y1),
-                opacity(ink, 0.05),
-            );
-        }
-    }
     if let Some(pass) = workspace
         .selected
         .and_then(|id| workspace.history.get(id.0))
@@ -5024,19 +5184,8 @@ fn draw_graph(
         p.outline(rect, 0.0, 1.5, colors.basic[2]);
     }
     if let Some(data) = &workspace.plot_data {
-        let traces = workspace
-            .point_view
-            .map_or(&data.spatial, |point| &data.points[point]);
-        let relative = |curve: &Curve| Curve {
-            frequency: curve.frequency.clone(),
-            db: curve.db.iter().map(|v| v - data.offset).collect(),
-        };
-        let enabled = |c| {
-            matches!(
-                (workspace.channels, c),
-                (Channels::Both, _) | (Channels::Left, 0) | (Channels::Right, 1)
-            )
-        };
+        let traces = data.traces(workspace.point_view);
+        let shown = |curve: &Curve| axis.map(&relative(curve, data.offset));
         for (i, &hz) in data
             .target
             .frequency
@@ -5056,36 +5205,15 @@ fn draw_graph(
                 );
             }
         }
-        for c in 0..2 {
-            if !enabled(c) {
-                continue;
-            }
-            let ink = colors.basic[if workspace.plot_kind == PlotKind::CorrectionFir {
-                4 + c
-            } else {
-                2
-            }];
-            if workspace.traces.contains(&Trace::Spread)
-                && workspace.point_view.is_none()
-                && data.points.len() > 1
-                && workspace.plot_kind == PlotKind::RoomResponse
-            {
-                for sign in [-1.0, 1.0] {
-                    let spread = Curve {
-                        frequency: traces.baseline[c].frequency.clone(),
-                        db: traces.baseline[c]
-                            .db
-                            .iter()
-                            .zip(&data.spread_db[c])
-                            .map(|(&b, &s)| b + sign * s - data.offset)
-                            .collect(),
-                    };
-                    channel_curve(p, &spread, plot, opacity(colors.secondary, 0.22), 1.0, c);
-                }
-            }
-            if workspace.plot_kind == PlotKind::CorrectionFir {
+        if response {
+            draw_smoothing_band(p, &overlay, recipe.smoothing);
+        }
+        for c in (0..2).filter(|&c| channel_enabled(c)) {
+            if !response {
+                let ink = colors.basic[4 + c];
                 channel_curve(p, &data.filter[c], plot, ink, 1.8, c);
-                if workspace.compare_parent
+                if workspace.selected.is_some()
+                    && workspace.compare_parent
                     && let Some(parent) = &data.parent_filter
                 {
                     channel_curve(p, &parent[c], plot, opacity(colors.secondary, 0.65), 1.0, c);
@@ -5100,100 +5228,116 @@ fn draw_graph(
                         c,
                     );
                 }
-            } else {
-                if workspace.traces.contains(&Trace::Measured) {
+                continue;
+            }
+            let smoothed = data
+                .smoothed
+                .as_ref()
+                .expect("smoothed traces refreshed before drawing");
+            if workspace.traces.contains(&Trace::Spread)
+                && workspace.point_view.is_none()
+                && data.points.len() > 1
+            {
+                for sign in [-1.0, 1.0] {
+                    let spread = Curve {
+                        frequency: smoothed.baseline[c].frequency.clone(),
+                        db: smoothed.baseline[c]
+                            .db
+                            .iter()
+                            .zip(&data.spread_db[c])
+                            .map(|(&b, &s)| b + sign * s)
+                            .collect(),
+                    };
                     channel_curve(
                         p,
-                        &relative(&traces.baseline[c]),
+                        &shown(&spread),
                         plot,
-                        opacity(colors.secondary, 0.55),
+                        opacity(colors.secondary, 0.22),
                         1.0,
                         c,
-                    );
-                }
-                if workspace.traces.contains(&Trace::Goal) {
-                    channel_curve(
-                        p,
-                        &relative(&traces.goal[c]),
-                        plot,
-                        opacity(colors.basic[6], 0.5),
-                        1.0,
-                        c,
-                    );
-                }
-                if workspace.traces.contains(&Trace::Predicted) {
-                    channel_curve(p, &relative(&traces.predicted[c]), plot, ink, 1.5, c);
-                }
-                if workspace.traces.contains(&Trace::Verified)
-                    && let Some(measured) = &traces.measured
-                {
-                    p.with_clip(
-                        Rect::new(
-                            x(measured.band.low),
-                            plot.y0,
-                            x(measured.band.high),
-                            plot.y1,
-                        ),
-                        |p| {
-                            channel_curve(
-                                p,
-                                &relative(&measured.curves[c]),
-                                plot,
-                                colors.basic[3],
-                                2.0,
-                                c,
-                            )
-                        },
-                    );
-                }
-                if workspace.compare_parent
-                    && let Some(parent) = &traces.parent
-                {
-                    p.with_clip(
-                        Rect::new(x(parent.band.low), plot.y0, x(parent.band.high), plot.y1),
-                        |p| {
-                            channel_curve(
-                                p,
-                                &relative(&parent.curves[c]),
-                                plot,
-                                opacity(colors.secondary, 0.7),
-                                1.0,
-                                c,
-                            )
-                        },
                     );
                 }
             }
+            if workspace.traces.contains(&Trace::Raw) {
+                channel_curve(
+                    p,
+                    &shown(&traces.baseline[c]),
+                    plot,
+                    opacity(colors.secondary, 0.3),
+                    1.0,
+                    c,
+                );
+            }
+            if workspace.traces.contains(&Trace::Measured) {
+                channel_curve(
+                    p,
+                    &shown(&smoothed.baseline[c]),
+                    plot,
+                    opacity(colors.secondary, 0.8),
+                    1.2,
+                    c,
+                );
+            }
+            if workspace.traces.contains(&Trace::Predicted) {
+                channel_curve(
+                    p,
+                    &shown(&smoothed.predicted[c]),
+                    plot,
+                    colors.basic[2],
+                    1.5,
+                    c,
+                );
+            }
+            if workspace.traces.contains(&Trace::Verified)
+                && let (Some(measured), Some(curves)) = (&traces.measured, &smoothed.measured)
+            {
+                p.with_clip(
+                    Rect::new(
+                        x(measured.band.low),
+                        plot.y0,
+                        x(measured.band.high),
+                        plot.y1,
+                    ),
+                    |p| channel_curve(p, &shown(&curves[c]), plot, colors.basic[3], 2.0, c),
+                );
+            }
+            if workspace.selected.is_some()
+                && workspace.compare_parent
+                && let Some(parent) = &traces.parent
+            {
+                p.with_clip(
+                    Rect::new(x(parent.band.low), plot.y0, x(parent.band.high), plot.y1),
+                    |p| {
+                        channel_curve(
+                            p,
+                            &shown(&parent.curves[c]),
+                            plot,
+                            opacity(colors.secondary, 0.7),
+                            1.0,
+                            c,
+                        )
+                    },
+                );
+            }
         }
-        if workspace.plot_kind == PlotKind::RoomResponse
-            && workspace.traces.contains(&Trace::Target)
-        {
+        if response && workspace.traces.contains(&Trace::Target) {
             p.with_clip(
                 Rect::new(x(recipe.range.low), plot.y0, x(recipe.range.high), plot.y1),
-                |p| p.curve(&relative(&data.target), plot, colors.basic[5], 1.5),
+                |p| p.curve(&shown(&data.target), plot, colors.basic[5], 1.5),
             );
         }
-    } else if let (Some(data), Some((low, high))) = (&acquired, raw_range) {
+        if response && workspace.traces.contains(&Trace::Effort) {
+            draw_effort(p, &overlay, recipe, !workspace.running);
+        }
+    } else if let Some(data) = &acquired {
         let curves = workspace
             .point_view
             .map_or(&data.magnitude, |point| &data.points[point]);
         if workspace.traces.contains(&Trace::Measured) {
             for (channel, curve) in curves.iter().enumerate() {
-                if matches!(
-                    (workspace.channels, channel),
-                    (Channels::Left, 1) | (Channels::Right, 0)
-                ) {
-                    continue;
+                if channel_enabled(channel) {
+                    channel_curve(p, &axis.map(curve), plot, colors.secondary, 1.5, channel);
                 }
-                let scaled = Curve {
-                    frequency: curve.frequency.clone(),
-                    db: curve
-                        .db
-                        .iter()
-                        .map(|db| 48.0 * (*db - low) / (high - low) - 24.0)
-                        .collect(),
-                };
-                channel_curve(p, &scaled, plot, colors.secondary, 1.5, channel);
             }
         }
         p.text(
@@ -5215,6 +5359,138 @@ fn draw_graph(
             Align::Center,
             colors.secondary,
         );
+    }
+}
+/// Shaded bass-to-treble smoothing transition with the crossover marked, labeled in the top strip.
+fn draw_smoothing_band(
+    p: &mut Painter<'_, super::Action>,
+    overlay: &Overlay,
+    smoothing: correction::Smoothing,
+) {
+    let colors = p.colors;
+    let plot = overlay.plot;
+    let (low, high) = smoothing.transition();
+    let (x0, x1) = (overlay.x(low).max(plot.x0), overlay.x(high).min(plot.x1));
+    let crossover = overlay.x(smoothing.crossover_hz);
+    p.rect(
+        Rect::new(x0, plot.y0, x1, plot.y1),
+        opacity(colors.basic[5], 0.04),
+    );
+    p.rect(
+        Rect::new(x0, overlay.strip.y0, x1, overlay.strip.y1),
+        opacity(colors.basic[5], 0.14),
+    );
+    p.line(
+        (crossover, plot.y0),
+        (crossover, plot.y1),
+        opacity(colors.basic[5], 0.35),
+        1.0,
+    );
+    for edge in [x0, x1] {
+        p.line(
+            (edge, overlay.strip.y0),
+            (edge, overlay.strip.y1),
+            opacity(colors.basic[5], 0.6),
+            1.5,
+        );
+    }
+    p.line(
+        (crossover, overlay.strip.y0),
+        (crossover, overlay.strip.y1),
+        colors.basic[5],
+        2.0,
+    );
+    let label = |p: &mut Painter<'_, super::Action>, text: &str, bounds: Rect, align: Align| {
+        if bounds.width() > p.advance(text, Face::Small) + 8.0 {
+            p.text(text, bounds, Face::Small, align, colors.secondary);
+        }
+    };
+    let strip = overlay.strip;
+    label(
+        p,
+        &format!("Bass {}", octave_label(smoothing.bass_octaves)),
+        Rect::new(strip.x0 + GAP, strip.y0, x0 - GAP, strip.y1),
+        Align::End,
+    );
+    label(
+        p,
+        &format!("Treble {}", octave_label(smoothing.treble_octaves)),
+        Rect::new(x1 + GAP, strip.y0, strip.x1 - GAP, strip.y1),
+        Align::Start,
+    );
+    label(
+        p,
+        &frequency_label(smoothing.crossover_hz),
+        Rect::new(crossover + 4.0, strip.y0, x1 - 4.0, strip.y1),
+        Align::Start,
+    );
+}
+/// The effort line with its draggable knots on its own 0-100 % scale.
+fn draw_effort(
+    p: &mut Painter<'_, super::Action>,
+    overlay: &Overlay,
+    recipe: &correction::Recipe,
+    editable: bool,
+) {
+    let ink = Trace::Effort.color(p.colors);
+    let range = recipe.range;
+    let knots = recipe.effort.points(range);
+    let mut frequencies: Vec<f64> = knots
+        .iter()
+        .map(|k| k.hz)
+        .chain([20.0, range.low, range.high, 20000.0])
+        .collect();
+    frequencies.sort_by(f64::total_cmp);
+    frequencies.dedup();
+    let line = frequencies.into_iter().flat_map(|hz| {
+        let outside = !range.contains(hz);
+        let at_edge = hz == range.low || hz == range.high;
+        let value = recipe.effort.at(hz, range);
+        // Effort steps to zero at a range edge the line does not fade into.
+        let edge = (at_edge && value > 0.0).then_some((hz, overlay.y(0.0)));
+        let (before, after) = match edge {
+            Some(zero) if hz == range.low => (Some(zero), None),
+            Some(zero) => (None, Some(zero)),
+            None => (None, None),
+        };
+        before
+            .into_iter()
+            .chain(std::iter::once((
+                hz,
+                overlay.y(if outside { 0.0 } else { value }),
+            )))
+            .chain(after)
+    });
+    p.curve(&overlay.screen_curve(line), overlay.plot, ink, 2.0);
+    let plot = overlay.plot;
+    for (effort, label) in [(1.0, "100%"), (0.0, "0%")] {
+        let y = overlay.y(effort);
+        p.text(
+            label,
+            Rect::new(plot.x1 - 44.0, y - 16.0, plot.x1 - 4.0, y),
+            Face::Small,
+            Align::End,
+            opacity(ink, 0.8),
+        );
+    }
+    if !editable {
+        return;
+    }
+    let handles: Vec<_> = match &recipe.effort {
+        correction::Effort::Easy {
+            level,
+            low_fade_octaves,
+            high_fade_octaves,
+        } => vec![
+            (range.low * low_fade_octaves.exp2(), *level),
+            (range.high / high_fade_octaves.exp2(), *level),
+        ],
+        correction::Effort::Advanced(points) => points.iter().map(|k| (k.hz, k.effort)).collect(),
+    };
+    for (hz, effort) in handles {
+        let center = overlay.point(hz, effort);
+        p.rounded(Rect::from_center_size(center, (10.0, 10.0)), 5.0, ink);
+        p.rounded(Rect::from_center_size(center, (4.0, 4.0)), 2.0, p.colors.bg);
     }
 }
 
@@ -5280,8 +5556,54 @@ mod tests {
         }
         assert_eq!(app.room_value(Parameter::MidGain), -3.0);
         assert_eq!(app.room_value(Parameter::MidWidth), 2.0);
-        app.room.dialog = Some(Dialog::Target);
         let _ = app.room_scene(Size::new(1200.0, 800.0), 1.0);
+    }
+
+    #[test]
+    fn custom_target_and_graph_handles_edit_the_recipe() {
+        let (_directory, mut app) = workspace();
+        app.room_action(Action::SetTarget(TargetPreset::Warm))
+            .unwrap();
+        app.room_action(Action::SetTarget(TargetPreset::Custom))
+            .unwrap();
+        let recipe = &app.settings.room.recipe;
+        assert!(TargetPreset::Custom.selects(&recipe.target));
+        assert_eq!(recipe.target.db(50.0), correction::Target::Warm.db(50.0));
+
+        let _ = app.room_scene(Size::new(1200.0, 800.0), 1.0);
+        let overlay = Overlay::new(app.room.graph);
+        let easy = app.settings.room.recipe.effort.clone();
+        app.room_action(Action::SetEffortMode(EffortMode::Advanced))
+            .unwrap();
+        let range = app.settings.room.recipe.range;
+        for hz in [21.0, 500.0, 19000.0] {
+            assert!(
+                (app.settings.room.recipe.effort.at(hz, range) - easy.at(hz, range)).abs() < 1e-9
+            );
+        }
+        let knots = app.settings.room.recipe.effort.points(range).len();
+        app.cursor = overlay.point(1000.0, 1.0);
+        app.begin_room_drag();
+        app.cursor.y = overlay.y(0.25);
+        let Some(super::super::Drag::Room(drag @ Drag::Knot(_))) = app.dragging else {
+            panic!("clicking the effort line adds a knot");
+        };
+        app.room_drag(drag, true);
+        app.dragging = None;
+        let effort = &app.settings.room.recipe.effort;
+        assert_eq!(effort.points(range).len(), knots + 1);
+        assert!((effort.at(1000.0, range) - 0.25).abs() < 0.02);
+
+        let crossover = app.settings.room.recipe.smoothing.crossover_hz;
+        app.cursor = Point::new(overlay.x(crossover), overlay.strip.center().y);
+        app.begin_room_drag();
+        app.cursor.x = overlay.x(400.0);
+        let Some(super::super::Drag::Room(drag @ Drag::Crossover)) = app.dragging else {
+            panic!("the smoothing strip grabs the crossover");
+        };
+        app.room_drag(drag, true);
+        app.dragging = None;
+        assert!((app.settings.room.recipe.smoothing.crossover_hz - 400.0).abs() < 5.0);
     }
 
     #[test]
@@ -5578,7 +5900,14 @@ mod tests {
         for stage in [Stage::Setup, Stage::Measure, Stage::Correction] {
             app.room_action(Action::Stage(stage)).unwrap();
             app.build_scene(Size::new(880.0, 760.0), 1.0);
-            assert_eq!(app.room.settings_bounds.width(), 880.0 - 2.0 * INSET);
+            assert_eq!(
+                app.room.settings_bounds.width(),
+                if stage == Stage::Correction {
+                    SIDEBAR_WIDTH
+                } else {
+                    880.0 - 2.0 * INSET
+                }
+            );
             let primary = match stage {
                 Stage::Setup => Action::Stage(Stage::Measure),
                 Stage::Measure => Action::Measure,
@@ -5602,8 +5931,9 @@ mod tests {
                     })
                     .unwrap()
                     .0;
-                assert_eq!(channels.x1, button.x1);
-                assert_eq!(app.room.graph.x1, button.x1);
+                assert_eq!(channels.x1, app.room.graph.x1);
+                assert_eq!(app.room.settings_bounds.x1, button.x1);
+                assert!(app.room.graph.x1 + INSET <= app.room.settings_bounds.x0);
             }
 
             if stage != Stage::Correction {
@@ -5827,7 +6157,7 @@ mod tests {
         assert_eq!(app.active.hash, active);
         let frozen: correction::Frozen =
             serde_json::from_slice(&app.store.get(&pass.objective).unwrap()).unwrap();
-        assert_eq!(frozen.recipe.global_effort, 0.5);
+        assert_eq!(frozen.recipe.effort, correction::Effort::easy(0.5));
     }
 
     #[test]

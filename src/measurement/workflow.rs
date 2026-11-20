@@ -209,15 +209,10 @@ pub enum Progress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     Prepared,
-    AlreadyWithinTarget,
-    NoTonalCorrection,
     ProcessedCorrectionVerified,
-    RequestedGoalReached,
     ImprovedLimitsReached,
     NoMeasurableImprovement,
     TimeLimit,
-    AttemptLimit,
-    MeasurementUnreliable,
     Stopped,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,10 +230,6 @@ pub enum Scope {
     ReferenceFull {
         position: usize,
         trusted: Band,
-    },
-    Targeted {
-        position: usize,
-        band: Band,
     },
     SpatialFull {
         positions: Vec<usize>,
@@ -336,7 +327,7 @@ impl Pass {
         !self.measured.is_empty()
             && !matches!(
                 self.scope,
-                Scope::Targeted { .. } | Scope::Prediction { .. } | Scope::SpatialPartial { .. }
+                Scope::Prediction { .. } | Scope::SpatialPartial { .. }
             )
             && !matches!(self.decision, Decision::Prepared | Decision::Provisional)
     }
@@ -1670,7 +1661,7 @@ mod persistence_contract_tests {
             target: room::Target::Flat,
             maximum_boost_db: Some(3.0),
             maximum_cut_db: Some(12.0),
-            global_effort: 0.5,
+            effort: room::Effort::easy(0.5),
             taps: room::Taps::Short,
             ..Recipe::default()
         };

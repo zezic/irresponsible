@@ -45,7 +45,7 @@ Spatial aggregation averages power, retaining each measured curve and its spread
 There is no complex average impulse response. The correction uses a common target
 shape and target offset, with independently designed stereo FIRs.
 
-Targets include Gentle, Natural, Warm, Flat, custom bass/tilt/mid bell and imported
+Targets include Gentle, Natural, Warm, Flat, Custom bass/tilt/mid bell and imported
 relative acoustic curves. The parametric mid bell is a Gaussian in log frequency,
 with a configurable 20 Hz-20 kHz center frequency, defaulting to 1 kHz. Gain ranges from -12 to +12 dB and defaults to 0 dB (neutral).
 Its full width at half gain ranges from 0.1 to 4 octaves and defaults to 1 octave.
@@ -63,8 +63,10 @@ processed goal = B + design
 ```
 
 The normalized Gaussian operates on all bins of the equal-log-frequency
-measurement grid. Zero width is identity. Default widths increase from 1/12 octave in the
-bass to 1/3 octave in the treble. The smoothed baseline is reused across candidate
+measurement grid. Zero width is identity. Bass width applies below a transition band
+and treble width above it, blended linearly in log frequency across the band. The
+band is set by its crossover frequency (default 1 kHz) and width (default 5 octaves);
+default widths are 1/12 octave in the bass and 1/3 octave in the treble. The smoothed baseline is reused across candidate
 target levels. The target curve is not averaged away. Smoothing measured response
 before fitting follows [REW's documented workflow](https://www.roomeqwizard.com/help/help_en-GB/html/eqwindow.html).
 
@@ -77,10 +79,11 @@ actual filter gain.
 Enabled gain limits apply a uniform dB ceiling or floor across the correction
 range. Noise and spatial spread are reported as measurement evidence.
 
-Global effort is applied once, after response smoothing. Optional regional effort
-and smoothing overrides resolve into one profile. Independent boundaries use
-automatic feathering. Removing an override restores the underlying profile.
-Regional controls are collapsed by default. Raw measurements are never rewritten.
+Effort is one line over frequency, applied once after response smoothing and zero
+outside the correction range. Easy effort is a level with linear fades from both
+range edges (default 1/6 octave). Advanced effort is a free line of knots, linear in
+log frequency between knots and flat beyond the outer knots; it starts from the easy
+line it replaces. Raw measurements are never rewritten.
 
 Optional level alignment attenuates the louder reference speaker; time alignment
 delays the earlier arrival. These are independent of tonal effort and remain in
@@ -95,8 +98,9 @@ are not published. FIR support and convolution buffering are distinct quantities
 ## Listening and verification
 
 Measurement creates a correction once. Listen loads that candidate; Bypass compares
-with the original. Target or regional edits prepare a replacement from the saved
-source and never silently change the playing filter.
+with the original. Target, smoothing, limit and effort edits prepare a replacement
+from the saved source. While the candidate is playing, the replacement plays as soon
+as it is ready; otherwise the playing filter is unchanged until Listen.
 
 Measure result checks the exact candidate at the reference position or all source
 positions. It does not change coefficients, smooth the accumulated filter, or
@@ -105,10 +109,13 @@ source. Noise and repeatability inform the result; only complete evidence can
 verify the requested scope. Spatial checks retain partial evidence for resuming.
 A failed check does not erase an earlier usable filter.
 
-The graph occupies the full correction workspace. Setup and Measure contain
-routing controls. Correction contains target controls, the graph, overall effort,
-and collapsible regional adjustments and measurement details. Diagnostic scores
-are not presented as a universal sound-quality rating.
+Setup and Measure contain routing controls. Correction shows the graph beside a
+settings column: target presets with a Custom target (tilt, bass shelf, mid bell)
+and import, smoothing, limits, effort and range, then collapsible advanced settings
+and measurement details. The graph draws the smoothed measurement, target,
+prediction, the smoothing transition band in a strip along its top and the effort
+line on its own 0-100 % scale; both are dragged directly on the graph. Diagnostic
+scores are not presented as a universal sound-quality rating.
 
 ## Persistence and exports
 
