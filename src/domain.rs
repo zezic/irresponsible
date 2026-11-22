@@ -258,6 +258,39 @@ impl From<ComparisonTrim> for f32 {
     }
 }
 
+/// Share of the engine's anti-clipping attenuation that is actually applied,
+/// in percent. Below 100% the user accepts possible clipping on loud material.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(try_from = "f32", into = "f32")]
+pub struct HeadroomFollow(f32);
+impl Default for HeadroomFollow {
+    fn default() -> Self {
+        Self(100.0)
+    }
+}
+impl HeadroomFollow {
+    pub fn percent(self) -> f32 {
+        self.0
+    }
+    pub fn fraction(self) -> f32 {
+        self.0 / 100.0
+    }
+}
+impl TryFrom<f32> for HeadroomFollow {
+    type Error = crate::error::Error;
+    fn try_from(percent: f32) -> Result<Self> {
+        if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+            return Err(invalid("Headroom follow must be between 0 and 100%"));
+        }
+        Ok(Self(percent))
+    }
+}
+impl From<HeadroomFollow> for f32 {
+    fn from(value: HeadroomFollow) -> Self {
+        value.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Controls {
@@ -265,6 +298,7 @@ pub struct Controls {
     pub correction: CorrectionMode,
     pub comparison: Comparison,
     pub trim: ComparisonTrim,
+    pub headroom: HeadroomFollow,
 }
 
 #[derive(Clone, Debug, Default)]

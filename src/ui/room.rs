@@ -1,5 +1,5 @@
 //! Native room workspace. Drawing and interaction share logical-point geometry.
-use super::chrome::ICON;
+use super::chrome::{ICON, Transport};
 use super::*;
 use irresponsible::{
     correction::room as correction,
@@ -31,7 +31,7 @@ pub(super) fn render_preview(
         controls_end: 81.0,
     });
     app.open_room_session(id)?;
-    app.room.opened = true;
+    app.mode = Mode::Build;
     app.message = "Drag effort knots on the graph; drag the smoothing band at its top.".into();
     app.room.stage = match state {
         PreviewState::RoomMeasure => Stage::Measure,
@@ -441,7 +441,7 @@ impl NativeSmoke {
                 }
                 assert!(self.app.commit_preset_name());
                 assert!(self.app.settings.presets.contains_key(&filter));
-                self.app.room.opened = true;
+                self.app.mode = Mode::Build;
                 let original = self.app.active.hash;
                 self.app.room_action(Action::Audition)?;
                 self.phase = SmokePhase::Audition { filter, original };
@@ -1058,7 +1058,6 @@ pub enum Channels {
     Right,
 }
 pub struct Workspace {
-    pub opened: bool,
     pub running: bool,
     pub muted: bool,
     pub expected: Option<audio::MeasurementId>,
@@ -1095,13 +1094,12 @@ pub struct Workspace {
 impl Workspace {
     /// Whether playback holds this workspace's candidate, so a prepared edit should replace it.
     pub(super) fn listening_to_candidate(&self, active: ContentHash) -> bool {
-        self.opened && self.return_to.is_none() && self.candidate == Some(active)
+        self.return_to.is_none() && self.candidate == Some(active)
     }
 }
 impl Default for Workspace {
     fn default() -> Self {
         Self {
-            opened: false,
             running: false,
             muted: false,
             expected: None,
@@ -1165,6 +1163,8 @@ fn audition_controls(base: Controls, filter: &Correction, reference_db: f32) -> 
         correction: CorrectionMode::On,
         comparison: Comparison::PinkNoise,
         trim: ComparisonTrim::default(),
+        // Audition levels are matched against full safety attenuation.
+        headroom: HeadroomFollow::default(),
     })
 }
 
@@ -1358,7 +1358,7 @@ impl App {
                 if self.settings.window_mode == WindowMode::Compact {
                     self.toggle_compact();
                 }
-                self.room.opened = true;
+                self.mode = Mode::Build;
                 self.message =
                     "Choose the measurement microphone and speaker route, then measure.".into();
                 if self.room.session.is_none()
@@ -1382,7 +1382,7 @@ impl App {
                 self.stop_room_audition()?;
                 self.cancel_preparation();
                 self.preview = None;
-                self.room.opened = false;
+                self.mode = Mode::Listen;
             }
             Stage(stage) => {
                 if !self.room.running && stage == self::Stage::Measure {
@@ -2825,9 +2825,8 @@ impl App {
         {
             self.room.dialog = None;
         }
-        let top = chrome.height;
         let geometry = layout::RoomLayout::new(size, chrome);
-        let navigation_y = geometry.navigation.y0;
+        let top = geometry.header.bottom();
         let bottom = geometry.status.y0;
         let center = geometry.actions;
         let content = geometry.body;
@@ -2869,36 +2868,6 @@ impl App {
         );
         p.rect(size.to_rect(), colors.body);
         p.rect(Rect::new(0.0, 0.0, size.width, top), colors.bg);
-        let title_y = (top - CONTROL) * 0.5;
-        let mut title_x = chrome.controls_end + GAP;
-        p.icon(
-            Icon::Waveform,
-            Rect::from_center_size((title_x + 15.0, top * 0.5), (ICON, ICON)),
-            colors.fg,
-        );
-        title_x += 38.0;
-        let title_width = p.advance("IRresponsible", Face::Title);
-        p.text(
-            "IRresponsible",
-            Rect::new(title_x, 0.0, title_x + title_width, top),
-            Face::Title,
-            Align::Start,
-            colors.fg,
-        );
-        title_x += title_width + INSET;
-        let selector_width = p.advance("Measurements", Face::Label).ceil() + 36.0;
-        p.titlebar_selector(
-            Rect::new(
-                title_x,
-                title_y,
-                title_x + selector_width,
-                title_y + CONTROL,
-            ),
-            "Measurements",
-            super::Action::Room(Action::Dialog(Some(Dialog::Measurements))),
-            self.room.dialog == Some(Dialog::Measurements),
-        );
-        let status_left = title_x + selector_width + INSET;
         let transport = if self.room.running {
             room_status(&self.room, &preferences)
         } else if self.room.return_to.is_some() {
@@ -2916,92 +2885,64 @@ impl App {
                 _ => "Audio stopped".into(),
             }
         };
-        let palette_x = size.width - INSET - CONTROL;
-        let bypass_x = palette_x - GAP - p.advance("Bypass", Face::Label).ceil() - INSET;
-        let transport_label = if self.room.running {
-            "Stop"
-        } else if self.room.muted {
-            "Resume"
-        } else if matches!(self.lifecycle, Lifecycle::Running { .. }) {
-            "Pause"
-        } else {
-            "Start"
-        };
-        let transport_x = bypass_x - GAP - p.advance(transport_label, Face::Label).ceil() - INSET;
-        p.text(
-            &transport,
-            Rect::new(status_left, 0.0, transport_x - INSET, top),
-            Face::Stat,
-            Align::End,
-            if matches!(self.lifecycle, Lifecycle::Running { .. }) {
-                colors.basic[2]
-            } else {
-                colors.secondary
-            },
-        );
-        p.button(
-            transport_x,
-            title_y,
-            transport_label,
-            if self.room.running {
-                super::Action::Room(Action::Stop)
-            } else if self.room.muted {
-                super::Action::Room(Action::ResumeListening)
-            } else {
-                super::Action::StartStop
-            },
-            true,
-        );
-        p.chip(
-            bypass_x,
-            title_y,
-            "Bypass",
-            super::Action::Bypass,
-            self.settings.controls.correction == CorrectionMode::Bypass,
-            !self.room.running,
-        );
-        p.ghost_icon(
-            Rect::new(
-                size.width - 40.0,
-                (top - CONTROL) / 2.0,
-                size.width - 16.0,
-                (top + CONTROL) / 2.0,
-            ),
-            Icon::Palette,
-            super::Action::ThemePicker(
-                match (self.settings.appearance.mode, self.system_appearance) {
-                    (ThemeMode::Fixed, _) => ThemeSlot::Fixed,
-                    (_, Appearance::Light) => ThemeSlot::Light,
-                    (_, Appearance::Dark) => ThemeSlot::Dark,
+        let (x0, x1) = super::draw_header(
+            &mut p,
+            geometry.header,
+            chrome,
+            super::HeaderParts {
+                mode: super::Mode::Build,
+                switchable: !self.room.running,
+                tools: &[(
+                    Icon::Palette,
+                    super::Action::ThemePicker(
+                        match (self.settings.appearance.mode, self.system_appearance) {
+                            (ThemeMode::Fixed, _) => ThemeSlot::Fixed,
+                            (_, Appearance::Light) => ThemeSlot::Light,
+                            (_, Appearance::Dark) => ThemeSlot::Dark,
+                        },
+                    ),
+                    !self.room.running,
+                )],
+                correction: self.settings.controls.correction,
+                bypass_enabled: !self.room.running,
+                transport: if self.room.running {
+                    (Transport::Stop, super::Action::Room(Action::Stop), true)
+                } else if self.room.muted {
+                    (
+                        Transport::Play,
+                        super::Action::Room(Action::ResumeListening),
+                        true,
+                    )
+                } else if matches!(self.lifecycle, Lifecycle::Running { .. }) {
+                    (Transport::Pause, super::Action::StartStop, true)
+                } else {
+                    (Transport::Play, super::Action::StartStop, true)
                 },
-            ),
-            !self.room.running,
+            },
         );
-
-        let mut x = geometry.navigation.x0;
+        let mut x = x0;
         for (label, stage) in [
             ("1  Measure", Stage::Measure),
             ("2  Correction", Stage::Correction),
         ] {
-            x =
-                p.chip(
-                    x,
-                    navigation_y,
-                    label,
-                    super::Action::Room(Action::Stage(stage)),
-                    self.room.stage == stage,
-                    true,
-                )
-                .x1 + GAP;
+            let width = p.advance(label, Face::Label).ceil() + INSET;
+            p.button_at(
+                geometry.header.row(x, width),
+                label,
+                super::Action::Room(Action::Stage(stage)),
+                self.room.stage == stage,
+                true,
+            );
+            x += width + GAP;
         }
-        let back_label = "Headphones";
-        let back_width = p.advance(back_label, Face::Label).ceil() + INSET;
-        p.button(
-            geometry.navigation.x1 - back_width,
-            navigation_y,
-            back_label,
-            super::Action::Room(Action::Close),
-            !self.room.running,
+        let selector_width = p.advance("Measurements", Face::Label).ceil() + INSET + 24.0;
+        p.dropdown(
+            geometry
+                .header
+                .row(x + GAP, selector_width.min(x1 - x - GAP)),
+            "Measurements",
+            super::Action::Room(Action::Dialog(Some(Dialog::Measurements))),
+            true,
         );
         let scroll = if self.room.dialog.is_none() {
             self.room.settings_scroll
@@ -3080,9 +3021,21 @@ impl App {
             &estimate,
         );
         p.rect(Rect::new(0.0, bottom, size.width, size.height), colors.bg);
+        let transport_x = size.width - INSET - p.advance(&transport, Face::Small).ceil();
+        p.text(
+            &transport,
+            Rect::new(transport_x, bottom, size.width - INSET, size.height),
+            Face::Small,
+            Align::End,
+            if matches!(self.lifecycle, Lifecycle::Running { .. }) {
+                colors.basic[2]
+            } else {
+                colors.secondary
+            },
+        );
         p.text(
             &self.message,
-            Rect::new(INSET, bottom, size.width - INSET, size.height),
+            Rect::new(INSET, bottom, transport_x - INSET, size.height),
             Face::Small,
             Align::Start,
             colors.secondary,
@@ -3268,7 +3221,7 @@ impl App {
             Self::draw_picker(&mut p, picker, &options, size.to_rect(), chrome);
         }
         let hint = if help_enabled {
-            help::target(&p.hits, self.cursor, false)
+            help::target(&p.hits, self.cursor, None)
         } else {
             None
         };
@@ -5273,7 +5226,7 @@ fn draw_workspace_actions(
                 estimate_label(estimate),
             ),
             Stage::Correction => (
-                if listening { "Listening" } else { "Listen" },
+                if listening { "Auditioning" } else { "Audition" },
                 Action::Listen,
                 !listening && w.candidate.is_some() && w.selected.is_none() && !preparing,
                 match (preparing, listening) {
@@ -5282,7 +5235,7 @@ fn draw_workspace_actions(
                     (false, true) => {
                         "Edits play as soon as they are prepared / compare with Bypass"
                     }
-                    (false, false) => "Listen to hear edits as you make them",
+                    (false, false) => "Audition to hear edits as you make them",
                 }
                 .into(),
             ),
@@ -5873,7 +5826,7 @@ mod tests {
             controls_end: 81.0,
         });
         app.room_action(Action::OpenMeasurement(session)).unwrap();
-        app.room.opened = true;
+        app.mode = Mode::Build;
         (directory, app)
     }
     fn fresh_workspace() -> (tempfile::TempDir, App) {
@@ -5888,7 +5841,7 @@ mod tests {
         app.settings.room.calibration = measurement::Calibration::Uncalibrated {
             acknowledged: false,
         };
-        app.room.opened = true;
+        app.mode = Mode::Build;
         app.room.stage = Stage::Measure;
         (directory, app)
     }
@@ -6217,7 +6170,7 @@ mod tests {
         }
         app.action(super::super::Action::CommitPresetName);
         app.build_scene(Size::new(880.0, 760.0), 1.0);
-        assert!(app.room.opened);
+        assert_eq!(app.mode, Mode::Build);
         assert!(app.room.dialog.is_none());
         assert_eq!(
             app.settings.presets.get(&exact).unwrap(),

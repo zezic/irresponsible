@@ -60,6 +60,8 @@ pub struct Settings {
     pub controls: Controls,
     pub active: Option<ContentHash>,
     pub presets: std::collections::BTreeMap<ContentHash, String>,
+    /// Recently activated profiles in stable slots, newest entry first.
+    pub recent: std::collections::VecDeque<RecentProfile>,
     pub window: WindowSize,
     pub window_mode: crate::appearance::WindowMode,
     pub compact_window: Option<crate::domain::WindowSize>,
@@ -70,6 +72,28 @@ pub struct Settings {
     pub catalog_target: Option<crate::catalog::CatalogTarget>,
     #[serde(flatten)]
     pub generation: crate::correction::GenerationSettings,
+}
+
+/// A profile activated earlier, labelled with its name at activation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecentProfile {
+    pub hash: ContentHash,
+    pub name: String,
+}
+impl Settings {
+    pub const RECENT: usize = 5;
+    /// Puts a newly activated profile in the first slot. A profile already
+    /// remembered keeps its slot, so the header row does not shift under clicks.
+    pub fn remember(&mut self, hash: ContentHash, name: &str) {
+        if self.recent.iter().any(|recent| recent.hash == hash) {
+            return;
+        }
+        self.recent.push_front(RecentProfile {
+            hash,
+            name: name.to_owned(),
+        });
+        self.recent.truncate(Self::RECENT);
+    }
 }
 
 fn preset_title(name: &str) -> &str {
@@ -161,4 +185,33 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     temp.persist(path).map_err(|e| e.error)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_profiles_keep_their_slots_and_drop_the_oldest() {
+        let mut settings = Settings::default();
+        let hashes: Vec<_> = (0..=Settings::RECENT as u8)
+            .map(|i| ContentHash::of(&[i]))
+            .collect();
+        for (i, hash) in hashes[..3].iter().enumerate() {
+            settings.remember(*hash, &format!("P{i}"));
+        }
+        settings.remember(hashes[0], "renamed");
+        let order = |s: &Settings| s.recent.iter().map(|r| r.hash).collect::<Vec<_>>();
+        assert_eq!(order(&settings), [hashes[2], hashes[1], hashes[0]]);
+        assert_eq!(settings.recent[2].name, "P0");
+        for hash in &hashes[3..] {
+            settings.remember(*hash, "new");
+        }
+        assert_eq!(settings.recent.len(), Settings::RECENT);
+        assert_eq!(
+            settings.recent.front().unwrap().hash,
+            hashes[Settings::RECENT]
+        );
+        assert!(!order(&settings).contains(&hashes[0]));
+    }
 }

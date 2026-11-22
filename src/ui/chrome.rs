@@ -9,7 +9,9 @@ use serde::Deserialize;
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 use vello::{
     Scene,
-    kurbo::{Affine, BezPath, Circle, Line, Point, Rect, RoundedRect, RoundedRectRadii, Stroke},
+    kurbo::{
+        Affine, BezPath, Circle, Line, Point, Rect, RoundedRect, RoundedRectRadii, Size, Stroke,
+    },
     peniko::{Blob, Color, Fill},
 };
 
@@ -21,6 +23,8 @@ pub const RADIUS: f64 = 4.0;
 pub const RULE: f64 = 1.5;
 pub const SIDEBAR: f64 = 282.0;
 pub const ICON: f64 = 16.0;
+/// Corner radius of the mode tabs, also the reach of their flares.
+pub const TAB_RADIUS: f64 = 6.0;
 
 pub fn opacity(color: Color, alpha: f32) -> Color {
     color.with_alpha(color.components[3] * alpha)
@@ -29,7 +33,6 @@ pub fn opacity(color: Color, alpha: f32) -> Color {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Icon {
-    Headphones,
     PlugsConnected,
     Waveform,
     SlidersHorizontal,
@@ -51,6 +54,17 @@ pub enum Icon {
     X,
     Palette,
     PencilSimple,
+    Play,
+    Pause,
+    Stop,
+}
+
+/// What the transport button does when pressed.
+#[derive(Clone, Copy)]
+pub enum Transport {
+    Play,
+    Pause,
+    Stop,
 }
 
 #[derive(Clone, Copy)]
@@ -73,7 +87,42 @@ struct IconFill {
     path: BezPath,
     alpha: f32,
 }
-pub struct Icons(BTreeMap<Icon, Vec<IconFill>>);
+pub struct Icons {
+    glyphs: BTreeMap<Icon, Vec<IconFill>>,
+    logo: Logo,
+}
+/// App wordmark: filled outlines in a `size` viewBox.
+struct Logo {
+    size: Size,
+    paths: Vec<BezPath>,
+}
+impl Logo {
+    fn new() -> Self {
+        let document = roxmltree::Document::parse(include_str!("../../assets/ir-logo.svg"))
+            .expect("embedded logo is valid SVG");
+        let view_box: Vec<f64> = document
+            .root_element()
+            .attribute("viewBox")
+            .expect("logo has a viewBox")
+            .split_whitespace()
+            .map(|value| value.parse().expect("logo viewBox is numeric"))
+            .collect();
+        let [0.0, 0.0, width, height] = view_box[..] else {
+            panic!("logo viewBox starts at the origin");
+        };
+        Self {
+            size: Size::new(width, height),
+            paths: document
+                .descendants()
+                .filter(|node| node.has_tag_name("path"))
+                .map(|node| {
+                    BezPath::from_svg(node.attribute("d").expect("logo path has outline data"))
+                        .expect("logo path is valid")
+                })
+                .collect(),
+        }
+    }
+}
 impl Icons {
     pub fn new() -> Self {
         #[derive(Deserialize)]
@@ -84,8 +133,9 @@ impl Icons {
         let paths: BTreeMap<Icon, Paths> =
             serde_json::from_str(include_str!("../../assets/icons.json"))
                 .expect("embedded icon catalogue is valid");
-        Self(
-            paths
+        Self {
+            logo: Logo::new(),
+            glyphs: paths
                 .into_iter()
                 .map(|(icon, paths)| {
                     let fills = paths
@@ -101,7 +151,7 @@ impl Icons {
                     (icon, fills)
                 })
                 .collect(),
-        )
+        }
     }
 }
 
@@ -164,7 +214,6 @@ pub fn list_text_regions(bounds: Rect) -> (Rect, Rect) {
 pub enum Face {
     Countdown,
     Title,
-    Stat,
     Label,
     Value,
     Small,
@@ -175,20 +224,19 @@ impl Face {
         match self {
             Self::Countdown => 28.0,
             Self::Title | Self::Label | Self::Value => 12.0,
-            Self::Stat => 11.5,
             Self::Small | Self::SmallValue => 10.0,
         }
     }
     fn family(self) -> &'static str {
         match self {
-            Self::Title | Self::Stat | Self::Label | Self::Small => "Inter Display",
+            Self::Title | Self::Label | Self::Small => "Inter Display",
             Self::Value | Self::SmallValue | Self::Countdown => "Iosevka",
         }
     }
     fn tracking(self) -> f32 {
         match self {
             Self::Value | Self::SmallValue | Self::Countdown => -self.size() * 0.1,
-            Self::Title | Self::Stat | Self::Label | Self::Small => 0.0,
+            Self::Title | Self::Label | Self::Small => 0.0,
         }
     }
 }
@@ -285,7 +333,7 @@ impl<'a, A: Copy + PartialEq> Painter<'a, A> {
         let transform = Affine::scale(self.scale)
             * Affine::translate((bounds.x0, bounds.y0))
             * Affine::scale(bounds.width() / 256.0);
-        for fill in &self.icons.0[&icon] {
+        for fill in &self.icons.glyphs[&icon] {
             self.scene.fill(
                 Fill::NonZero,
                 transform,
@@ -294,6 +342,17 @@ impl<'a, A: Copy + PartialEq> Painter<'a, A> {
                 &fill.path,
             );
         }
+    }
+    /// Draws the app logo `height` tall from `origin` and returns its width.
+    pub fn logo(&mut self, origin: Point, height: f64, color: Color) -> f64 {
+        let logo = &self.icons.logo;
+        let scale = height / logo.size.height;
+        let transform =
+            Affine::scale(self.scale) * Affine::translate(origin.to_vec2()) * Affine::scale(scale);
+        for path in &logo.paths {
+            self.scene.fill(Fill::NonZero, transform, color, None, path);
+        }
+        logo.size.width * scale
     }
     fn shape(&mut self, text: &str, face: Face) -> parley::Layout<[u8; 4]> {
         let mut builder = self.layout.ranged_builder(self.fonts, text, 1.0, true);
@@ -514,6 +573,149 @@ impl<'a, A: Copy + PartialEq> Painter<'a, A> {
                 },
                 if enabled { 1.0 } else { 0.4 },
             ),
+        );
+        if enabled {
+            self.hits.push((bounds, action));
+        }
+    }
+    /// Mode tab standing on the header's bottom edge. The selected tab takes
+    /// the page colour and flares into the page with concave lower corners.
+    pub fn mode_tab(&mut self, bounds: Rect, text: &str, action: A, selected: bool, enabled: bool) {
+        let (plate, ink) = match self.state(bounds, action, selected) {
+            State::Active => (self.colors.body, self.colors.fg),
+            State::Pressed => (opacity(self.colors.fg, 0.3), self.colors.fg),
+            State::Hovered => (self.colors.ghost_intense, self.colors.fg),
+            State::Idle => (self.colors.ghost, self.colors.secondary),
+        };
+        let alpha = if enabled || selected { 1.0 } else { 0.4 };
+        let Rect { x0, y0, x1, y1 } = bounds;
+        let r = TAB_RADIUS;
+        let flare = if selected { r } else { 0.0 };
+        let mut path = BezPath::new();
+        path.move_to((x0 - flare, y1));
+        path.quad_to((x0, y1), (x0, y1 - flare));
+        path.line_to((x0, y0 + r));
+        path.quad_to((x0, y0), (x0 + r, y0));
+        path.line_to((x1 - r, y0));
+        path.quad_to((x1, y0), (x1, y0 + r));
+        path.line_to((x1, y1 - flare));
+        path.quad_to((x1, y1), (x1 + flare, y1));
+        path.close_path();
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::scale(self.scale),
+            opacity(plate, alpha),
+            None,
+            &path,
+        );
+        self.text(
+            text,
+            bounds,
+            Face::Label,
+            Align::Center,
+            opacity(ink, alpha),
+        );
+        if enabled && !selected {
+            self.hits.push((bounds, action));
+        }
+    }
+    /// Profile button with its name in the top-left corner over a faint
+    /// silhouette of its filter response.
+    pub fn profile_tile(
+        &mut self,
+        bounds: Rect,
+        name: &str,
+        shape: Option<&irresponsible::correction::Curve>,
+        action: A,
+        selected: bool,
+    ) {
+        let ink = self.plate(bounds, action, selected, true);
+        if let Some(curve) = shape {
+            let (low, high) = curve
+                .db
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &db| {
+                    (low.min(db), high.max(db))
+                });
+            let middle = (low + high) * 0.5;
+            let span = (high - low).max(12.0);
+            let area = Rect::new(bounds.x0, bounds.y0 + 14.0, bounds.x1, bounds.y1 - 3.0);
+            let points = curve.db.len() - 1;
+            let mut path = BezPath::new();
+            path.move_to((area.x0, bounds.y1));
+            for (i, &db) in curve.db.iter().enumerate() {
+                let x = area.x0 + area.width() * i as f64 / points as f64;
+                let y = area.center().y - f64::from((db - middle) / span) * area.height();
+                path.line_to((x, y));
+            }
+            path.line_to((area.x1, bounds.y1));
+            path.close_path();
+            self.scene.push_clip_layer(
+                Fill::NonZero,
+                Affine::scale(self.scale),
+                &RoundedRect::from_rect(bounds, RADIUS),
+            );
+            self.scene.fill(
+                Fill::NonZero,
+                Affine::scale(self.scale),
+                opacity(ink, 0.12),
+                None,
+                &path,
+            );
+            self.scene.pop_layer();
+        }
+        self.text(
+            name,
+            Rect::new(
+                bounds.x0 + GAP,
+                bounds.y0 + 2.0,
+                bounds.x1 - GAP,
+                bounds.y0 + 20.0,
+            ),
+            Face::Label,
+            Align::Start,
+            ink,
+        );
+    }
+    /// Round transport button filling the square `bounds`. Idle audio shows
+    /// a faint plate so the solid one marks audio that is running.
+    pub fn transport(&mut self, bounds: Rect, transport: Transport, action: A, enabled: bool) {
+        let state = self.state(bounds, action, false);
+        let (plate, ink) = match transport {
+            Transport::Play => (
+                match state {
+                    State::Pressed => opacity(self.colors.fg, 0.3),
+                    State::Hovered => self.colors.ghost_intense,
+                    _ => self.colors.ghost,
+                },
+                self.colors.fg,
+            ),
+            Transport::Pause | Transport::Stop => (
+                match state {
+                    State::Pressed => opacity(self.colors.fg, 0.6),
+                    State::Hovered => opacity(self.colors.fg, 0.85),
+                    _ => self.colors.fg,
+                },
+                self.colors.bg,
+            ),
+        };
+        let alpha = if enabled { 1.0 } else { 0.4 };
+        self.scene.fill(
+            Fill::NonZero,
+            Affine::scale(self.scale),
+            plate,
+            None,
+            &Circle::new(bounds.center(), bounds.width() * 0.5),
+        );
+        let glyph = (bounds.width() * 0.4).round();
+        self.icon(
+            match transport {
+                Transport::Play => Icon::Play,
+                Transport::Pause => Icon::Pause,
+                Transport::Stop => Icon::Stop,
+            },
+            Rect::from_center_size(bounds.center(), (glyph, glyph)),
+            opacity(ink, alpha),
         );
         if enabled {
             self.hits.push((bounds, action));
@@ -1007,8 +1209,8 @@ mod tests {
     #[test]
     fn collapse_chevrons_are_regular_single_weight_paths() {
         let icons = Icons::new();
-        assert_eq!(icons.0[&Icon::CaretDown].len(), 1);
-        assert_eq!(icons.0[&Icon::CaretRight].len(), 1);
+        assert_eq!(icons.glyphs[&Icon::CaretDown].len(), 1);
+        assert_eq!(icons.glyphs[&Icon::CaretRight].len(), 1);
     }
     #[test]
     fn profile_text_has_equal_padding_and_the_filter_maps_visible_text_to_selection() {

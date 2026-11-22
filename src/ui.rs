@@ -25,11 +25,12 @@ mod window_chrome;
 
 use chrome::{
     Align, CONTROL, Face, GAP, INSET, Icon, Icons, MenuChecks, Painter, RADIUS, ROW, RULE, SIDEBAR,
-    opacity,
+    TAB_RADIUS, Transport, opacity,
 };
 use layout::{GraphLayout, Layout};
 use parley::{FontContext, LayoutContext};
 use scrollbar::Scrollbar;
+use std::collections::BTreeMap;
 use std::{
     sync::{
         Arc,
@@ -72,7 +73,7 @@ enum Action {
     LoginSettings,
     ChooseTheme(ThemeSlot, usize),
     PresetPicker,
-    LoadPreset(ContentHash),
+    LoadSaved(ContentHash),
     SavePreset,
     PresetName,
     CommitPresetName,
@@ -122,6 +123,7 @@ enum Action {
     ShowMeasured,
     ShowTarget,
     ShowPrediction,
+    BrowseCatalog,
     BrowsePresets,
     BrowseGeneration,
     BrowseGeneral,
@@ -145,11 +147,13 @@ enum RouteSide {
 enum ScrollSurface {
     RoomSettings,
     Sidebar,
+    Preferences,
     Picker,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ValueBar {
     Volume,
+    HeadroomFollow,
     SpectrumIntensity,
     Room(room::Bar),
 }
@@ -327,23 +331,93 @@ impl SelectedProfile {
     }
 }
 
-#[derive(Default, PartialEq, Eq)]
+/// Width of a recent-profile tile in the header.
+const RECENT_WIDTH: f64 = 150.0;
+
+/// Mode-specific parts of the shared header.
+struct HeaderParts<'a> {
+    mode: Mode,
+    /// False while a running workflow pins the current mode.
+    switchable: bool,
+    /// Ghost icons placed under Bypass.
+    tools: &'a [(Icon, Action, bool)],
+    correction: CorrectionMode,
+    bypass_enabled: bool,
+    /// Icon, action and whether the transport can act.
+    transport: (Transport, Action, bool),
+}
+
+/// Draws the shared header: the title beside the native window buttons, the
+/// Listen/Build tabs on the bottom edge, and Bypass over the tools beside the
+/// transport circle at the right end. Returns the free span of the fat row.
+fn draw_header(
+    p: &mut Painter<'_, Action>,
+    header: layout::Header,
+    chrome: WindowChrome,
+    parts: HeaderParts<'_>,
+) -> (f64, f64) {
+    let logo_height = (chrome.height - GAP) * 0.81;
+    let logo_x = chrome.controls_end;
+    let x = logo_x
+        + p.logo(
+            Point::new(logo_x, (chrome.height - logo_height) * 0.5),
+            logo_height,
+            p.colors.fg,
+        );
+    let mut tab_x = INSET;
+    for (label, target, action) in [
+        ("Listen", Mode::Listen, Action::Room(room::Action::Close)),
+        ("Build", Mode::Build, Action::Room(room::Action::Open)),
+    ] {
+        let tab = header.tab(tab_x, tab_x + p.advance(label, Face::Label).ceil() + INSET);
+        p.mode_tab(tab, label, action, parts.mode == target, parts.switchable);
+        tab_x = tab.x1 + TAB_RADIUS;
+    }
+    let transport = header.transport();
+    let (icon, action, enabled) = parts.transport;
+    p.transport(transport, icon, action, enabled);
+    let edge = transport.x0 - GAP;
+    let bypass_width = p.advance("Bypass", Face::Label).ceil() + INSET;
+    let bypass = header.upper(edge, bypass_width);
+    p.button_at(
+        bypass,
+        "Bypass",
+        Action::Bypass,
+        parts.correction == CorrectionMode::Bypass,
+        parts.bypass_enabled,
+    );
+    let mut tool_x = edge;
+    for &(icon, action, enabled) in parts.tools.iter().rev() {
+        let tool = header.lower(tool_x, CONTROL);
+        p.ghost_icon(tool, icon, action, enabled);
+        tool_x = tool.x0;
+    }
+    let column = bypass.x0.min(tool_x);
+    (x.max(tab_x) + INSET, column - INSET)
+}
+
+/// Top-level workspace switched from the header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Choose, compare and play profiles.
+    Listen,
+    /// Measure with a microphone and shape a new profile.
+    Build,
+}
+
+/// Library listed in the left sidebar under the shared search field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Browser {
     #[default]
     Catalog,
     Presets,
-    Generation,
-    General,
-    Spectrum,
 }
-
-impl Browser {
-    fn is_preferences(&self) -> bool {
-        matches!(
-            self,
-            Self::Generation | Self::General | Self::Presets | Self::Spectrum
-        )
-    }
+/// Page of the right-side preferences panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreferencePage {
+    General,
+    Generation,
+    Spectrum,
 }
 
 #[derive(Clone)]
@@ -571,7 +645,7 @@ pub fn run_simulated() -> Result<()> {
     scenario.pace = irresponsible::measurement::simulation::Pace::RealTime;
     let event_loop = EventLoop::new().map_err(|e| invalid(e.to_string()))?;
     let mut app = App::with_backend(store, audio::Backend::Simulated(scenario))?;
-    app.room.opened = true;
+    app.mode = Mode::Build;
     event_loop
         .run_app(&mut app)
         .map_err(|e| invalid(e.to_string()))
@@ -699,6 +773,13 @@ pub fn render_preview(
     app.settings
         .presets
         .insert(app.active.hash, "DT 990 / everyday".into());
+    // Render-only recents; the extra hashes are never loaded by a preview.
+    for name in ["Desk speakers / Natural", "HD 600 / Harman"] {
+        app.settings
+            .remember(ContentHash::of(name.as_bytes()), name);
+    }
+    app.settings
+        .remember(app.active.hash, &app.active.correction.name);
     app.catalog = catalog;
     if let Some(catalog) = &app.catalog {
         let index = catalog.entries.iter().position(|entry| entry.path == "Auriculares%20Argentina/over-ear/Beyerdynamic%20DT%20990%20Pro%20(250%20Ohm)").expect("fixture has the comparison profile");
@@ -799,7 +880,10 @@ pub fn render_preview(
             app.theme = Theme::new(app.settings.appearance.selected(Appearance::Light));
             app.action(Action::Preferences);
         }
-        PreviewState::Presets => app.open_picker(PickerKind::Presets),
+        PreviewState::Presets => {
+            app.settings.window_mode = WindowMode::Compact;
+            app.open_picker(PickerKind::Presets);
+        }
         PreviewState::PresetName => app.action(Action::SavePreset),
         PreviewState::Compact => {}
         PreviewState::PresetList => {
@@ -876,6 +960,9 @@ struct App {
     audio_backend: audio::Backend,
     store: Store,
     settings: Settings,
+    /// Filter silhouettes of the recent profiles, `None` for one whose stored
+    /// correction cannot be read.
+    shapes: BTreeMap<ContentHash, Option<Curve>>,
     theme: Theme,
     system_appearance: Appearance,
     runtime: Runtime,
@@ -913,6 +1000,9 @@ struct App {
     settings_healthy: bool,
     login: std::result::Result<login::Status, String>,
     browser: Browser,
+    /// Open page of the preferences panel; the sidebar stays usable beside it.
+    preferences: Option<PreferencePage>,
+    preference_scroll: f64,
     persist_after: Option<Instant>,
     icons: Icons,
     pressed: Option<Action>,
@@ -922,6 +1012,7 @@ struct App {
     filter_layout: Option<chrome::FieldLayout>,
     clipboard: Option<arboard::Clipboard>,
     window_chrome: Option<WindowChrome>,
+    mode: Mode,
 }
 
 impl App {
@@ -996,6 +1087,7 @@ impl App {
         let theme = Theme::new(settings.appearance.selected(system_appearance));
         Ok(Self {
             room: room::Workspace::default(),
+            shapes: BTreeMap::new(),
             audio_backend: backend,
             theme,
             system_appearance,
@@ -1036,6 +1128,8 @@ impl App {
             settings_healthy,
             login: login::status().map_err(|error| error.to_string()),
             browser: Browser::Catalog,
+            preferences: None,
+            preference_scroll: 0.0,
             persist_after: None,
             icons: Icons::new(),
             pressed: None,
@@ -1045,6 +1139,7 @@ impl App {
             filter_layout: None,
             clipboard: None,
             window_chrome: None,
+            mode: Mode::Listen,
         })
     }
     fn refresh_login(&mut self) {
@@ -1105,7 +1200,7 @@ impl App {
             self.stop_owned_measurement();
             return true;
         }
-        if self.room.opened && self.room.dialog.is_some() && self.picker.is_none() {
+        if self.mode == Mode::Build && self.room.dialog.is_some() && self.picker.is_none() {
             self.text_focus = None;
             self.action(Action::Room(room::Action::Dialog(None)));
             return true;
@@ -1127,6 +1222,11 @@ impl App {
     fn volume(&mut self, db: f32) {
         self.settings.controls.volume =
             VolumeDb::try_from(db.clamp(-80.0, 0.0)).expect("slider clamps to valid volume");
+        self.controls_changed();
+    }
+    fn headroom_follow(&mut self, percent: f32) {
+        self.settings.controls.headroom = HeadroomFollow::try_from(percent.clamp(0.0, 100.0))
+            .expect("slider clamps to valid headroom follow");
         self.controls_changed();
     }
     fn current_rate(&self) -> Rate {
@@ -1428,7 +1528,7 @@ impl App {
             self.stop_owned_measurement();
             return;
         }
-        if self.room.opened
+        if self.mode == Mode::Build
             && self.room.dialog.is_some()
             && matches!(
                 action,
@@ -1437,7 +1537,7 @@ impl App {
         {
             return;
         }
-        if self.room.opened && action == Action::Search {
+        if self.mode == Mode::Build && action == Action::Search {
             return;
         }
         self.dirty |= self.help.clear();
@@ -1461,30 +1561,27 @@ impl App {
             self.dirty = true;
             return;
         }
-        if self.room.opened && action == Action::SavePreset {
+        if self.mode == Mode::Build && action == Action::SavePreset {
             if let Err(error) = self.save_room_preset() {
                 self.message = error.to_string();
             }
             self.dirty = true;
             return;
         }
-        if self.room.opened && action == Action::Preferences {
-            if let Err(error) = self.room_action(room::Action::Close) {
-                self.message = error.to_string();
-                self.dirty = true;
-                return;
-            }
-            self.browser = Browser::Catalog;
+        if self.mode == Mode::Build
+            && action == Action::Preferences
+            && let Err(error) = self.room_action(room::Action::Close)
+        {
+            self.message = error.to_string();
+            self.dirty = true;
+            return;
         }
         if self.picker.is_some()
             && !matches!(action, Action::PickerSearch | Action::ClearPickerSearch)
         {
             self.dismiss_picker();
         }
-        if action == Action::Search
-            && self.settings.window_mode == WindowMode::Compact
-            && self.browser != Browser::Presets
-        {
+        if action == Action::Search && self.settings.window_mode == WindowMode::Compact {
             self.toggle_compact();
         }
         self.text_focus = if action == Action::Search {
@@ -1492,15 +1589,6 @@ impl App {
         } else {
             None
         };
-        if action == Action::Search
-            && matches!(
-                self.browser,
-                Browser::Generation | Browser::General | Browser::Spectrum
-            )
-        {
-            self.browser = Browser::Catalog;
-            self.scroll = 0.0;
-        }
         match action {
             Action::Room(action) => {
                 if let Err(e) = self.room_action(action) {
@@ -1510,13 +1598,12 @@ impl App {
             Action::Scroll(..) => unreachable!("scrollbar dragging begins on mouse press"),
             Action::Preferences => {
                 self.dismiss_picker();
-                self.browser = if self.browser.is_preferences() {
-                    Browser::Catalog
-                } else {
-                    Browser::General
+                self.preferences = match self.preferences {
+                    Some(_) => None,
+                    None => Some(PreferencePage::General),
                 };
-                self.scroll = 0.0;
-                if self.browser == Browser::General {
+                self.preference_scroll = 0.0;
+                if self.preferences == Some(PreferencePage::General) {
                     self.refresh_login();
                 }
             }
@@ -1565,7 +1652,7 @@ impl App {
                 self.dismiss_picker();
                 self.save();
             }
-            Action::LoadPreset(hash) => {
+            Action::LoadSaved(hash) => {
                 self.dismiss_picker();
                 self.select_saved(hash);
                 self.request_load();
@@ -1666,18 +1753,18 @@ impl App {
                 self.save();
             }
             Action::BrowseSpectrum => {
-                self.browser = Browser::Spectrum;
-                self.scroll = 0.0;
+                self.preferences = Some(PreferencePage::Spectrum);
+                self.preference_scroll = 0.0;
             }
             Action::BrowseGeneral => {
-                self.browser = Browser::General;
+                self.preferences = Some(PreferencePage::General);
                 self.refresh_login();
                 self.dismiss_picker();
-                self.scroll = 0.0;
+                self.preference_scroll = 0.0;
             }
             Action::BrowseGeneration => {
-                self.browser = Browser::Generation;
-                self.scroll = 0.0;
+                self.preferences = Some(PreferencePage::Generation);
+                self.preference_scroll = 0.0;
             }
             Action::CatalogFilter => self.open_picker(PickerKind::CatalogFilter),
             Action::ChooseCatalogFilter(filter) => {
@@ -1685,13 +1772,12 @@ impl App {
                 self.scroll = 0.0;
                 self.save();
             }
+            Action::BrowseCatalog => self.browse(Browser::Catalog),
             Action::BrowsePresets => {
                 if self.browser != Browser::Presets {
-                    self.filter.clear();
+                    self.selected = None;
                 }
-                self.browser = Browser::Presets;
-                self.selected = None;
-                self.scroll = 0.0;
+                self.browse(Browser::Presets);
             }
             Action::Recall(hash) => self.select_saved(hash),
             Action::DeletePreset(hash) => {
@@ -2247,6 +2333,25 @@ impl App {
         self.last_click = Some((now, self.cursor, target, count));
         count
     }
+    fn browse(&mut self, browser: Browser) {
+        if self.browser != browser {
+            self.filter.clear();
+            self.scroll = 0.0;
+        }
+        self.browser = browser;
+    }
+    /// Right-side preferences panel between the header and the status bar.
+    fn preference_pane(&self, size: Size) -> Rect {
+        let chrome = self.window_chrome.expect("live chrome");
+        let (top, bottom) = match self.settings.window_mode {
+            WindowMode::Full => {
+                let layout = Layout::new(size, self.details, self.has_candidate(), chrome);
+                (layout.header.bottom(), layout.status.y0)
+            }
+            WindowMode::Compact => (chrome.height, size.height),
+        };
+        Rect::new(size.width - SIDEBAR, top, size.width, bottom)
+    }
     fn navigate_catalog(&mut self, direction: Navigation) {
         if self.browser != Browser::Catalog || self.settings.window_mode == WindowMode::Compact {
             return;
@@ -2569,7 +2674,7 @@ impl App {
                 .map(|(hash, name)| {
                     (
                         name.clone(),
-                        Action::LoadPreset(*hash),
+                        Action::LoadSaved(*hash),
                         *hash == self.active.hash,
                     )
                 })
@@ -2852,6 +2957,7 @@ impl App {
         match surface {
             ScrollSurface::RoomSettings => self.room.settings_scroll = offset,
             ScrollSurface::Sidebar => self.scroll = offset,
+            ScrollSurface::Preferences => self.preference_scroll = offset,
             ScrollSurface::Picker => {
                 self.picker
                     .as_mut()
@@ -2875,6 +2981,7 @@ impl App {
         match target {
             ValueBar::Room(parameter) => self.reset_room_bar(parameter),
             ValueBar::Volume => self.volume(Controls::default().volume.db()),
+            ValueBar::HeadroomFollow => self.headroom_follow(HeadroomFollow::default().percent()),
             ValueBar::SpectrumIntensity => self
                 .set_number(
                     NumberField::SpectrumIntensity,
@@ -2890,6 +2997,7 @@ impl App {
                 self.room_bar_from_fraction(parameter, f64::from(fraction))
             }
             ValueBar::Volume => self.volume(fraction * 80.0 - 80.0),
+            ValueBar::HeadroomFollow => self.headroom_follow(fraction * 100.0),
             ValueBar::SpectrumIntensity => self
                 .set_number(NumberField::SpectrumIntensity, fraction * 100.0)
                 .expect("slider clamps to valid intensity"),
@@ -2904,7 +3012,12 @@ impl App {
     }
     fn help_target(&self) -> Option<help::Hint> {
         if self.help_enabled() {
-            help::target(&self.hits, self.cursor, self.browser.is_preferences())
+            help::target(
+                &self.hits,
+                self.cursor,
+                self.preferences
+                    .map(|_| self.preference_pane(self.viewport())),
+            )
         } else {
             None
         }
@@ -2994,6 +3107,10 @@ impl App {
                     self.active_from_receipt(correction);
                 }
                 self.settings.active = Some(self.active.hash);
+                if !matches!(self.active.correction.origin, Origin::Identity) {
+                    self.settings
+                        .remember(self.active.hash, &self.active.correction.name);
+                }
                 self.save();
             }
         }
@@ -3030,7 +3147,8 @@ impl App {
                 };
                 match result {
                     Ok(JobResult::RoomPrepared(session, view, engine)) => {
-                        let following = self.room.listening_to_candidate(self.active.hash);
+                        let following = self.mode == Mode::Build
+                            && self.room.listening_to_candidate(self.active.hash);
                         match self.accept_room_preparation(session) {
                             Ok(()) => {
                                 self.preview = Some((view, engine));
@@ -3176,15 +3294,45 @@ impl App {
                 .expect("window chrome is measured before layout"),
         )
     }
+    /// Bottom of the header: compact Listen keeps only the titlebar band.
+    fn header_bottom(&self) -> f64 {
+        let chrome = self.window_chrome.expect("live chrome");
+        if self.mode == Mode::Listen && self.settings.window_mode == WindowMode::Compact {
+            chrome.height
+        } else {
+            layout::Header::new(0.0, chrome).bottom()
+        }
+    }
     fn scale(&self) -> f64 {
         self.window
             .as_ref()
             .map_or(1.0, |window| window.scale_factor())
     }
+    /// Computes the silhouettes of recent profiles not yet drawn.
+    fn trace_recent_shapes(&mut self) {
+        for recent in &self.settings.recent {
+            self.shapes.entry(recent.hash).or_insert_with(|| {
+                let bytes = self.store.get(&recent.hash).ok()?;
+                let correction: Correction = serde_json::from_slice(&bytes).ok()?;
+                let [left, right] = correction.response(48);
+                let db = left
+                    .db
+                    .iter()
+                    .zip(&right.db)
+                    .map(|(l, r)| (l + r) * 0.5)
+                    .collect();
+                Some(Curve {
+                    frequency: left.frequency,
+                    db,
+                })
+            });
+        }
+    }
     fn build_scene(&mut self, size: Size, scale: f64) -> Scene {
-        if self.room.opened {
+        if self.mode == Mode::Build {
             return self.room_scene(size, scale);
         }
+        self.trace_recent_shapes();
         let chrome = self
             .window_chrome
             .expect("window chrome is measured before drawing");
@@ -3196,7 +3344,9 @@ impl App {
             Layout::graph_layout,
         );
         let colors = self.theme.current;
-        let top = chrome.height;
+        let top = full
+            .as_ref()
+            .map_or(chrome.height, |layout| layout.header.bottom());
         let catalog_target = self.catalog_target();
         let editable_catalog_index = self.editable_catalog_index();
         let browsing_catalog = matches!(
@@ -3215,6 +3365,7 @@ impl App {
             .filter(|view| view.correction.measured().is_some())
             .unwrap_or(&self.active);
         let help_enabled = self.help_enabled();
+        let pane = self.preference_pane(size);
         let mut p = Painter::new(
             &mut self.fonts,
             &mut self.layout,
@@ -3232,8 +3383,6 @@ impl App {
                 | Lifecycle::Starting
                 | Lifecycle::Recovering { .. }
         );
-        let transport_label = if running { "Stop" } else { "Start" };
-        let transport_enabled = running || self.settings.route.is_some();
         let status = match &self.lifecycle {
             Lifecycle::Stopped => if self.settings.route.is_some() {
                 "Audio stopped"
@@ -3258,120 +3407,108 @@ impl App {
             Lifecycle::Recovering { attempt, .. } => format!("Recovering  {attempt}/3"),
             Lifecycle::Failed(_) => "Failed / check route, then Retry".into(),
         };
+        let status_ink = match self.lifecycle {
+            Lifecycle::Running { .. } => match self.settings.controls.correction {
+                CorrectionMode::On => colors.basic[2],
+                CorrectionMode::Bypass => colors.basic[1],
+            },
+            Lifecycle::Failed(_) => colors.basic[1],
+            _ => colors.secondary,
+        };
         p.rect(window, colors.body);
         p.rect(Rect::new(0.0, 0.0, window.x1, top), colors.bg);
-        let compact = self.settings.window_mode == WindowMode::Compact;
-        let mut x = chrome.controls_end + 8.0;
-        if !compact {
-            p.icon(
-                Icon::Headphones,
-                Rect::from_center_size((x + 15.0, top * 0.5), (16.0, 16.0)),
-                colors.fg,
-            );
-            x += 38.0;
-            let title_width = p.advance("IRresponsible", Face::Title);
-            p.text(
-                "IRresponsible",
-                Rect::new(x, 0.0, x + title_width, top),
-                Face::Title,
-                Align::Start,
-                colors.fg,
-            );
-            x += title_width + GAP;
-        }
-        p.ghost_icon(
-            Rect::new(x, (top - CONTROL) * 0.5, x + CONTROL, (top + CONTROL) * 0.5),
-            Icon::GearSix,
-            Action::Preferences,
-            true,
-        );
-        x += CONTROL + GAP;
-        let compact_x = window.x1 - INSET - CONTROL;
-        p.ghost_icon(
-            Rect::new(
-                compact_x,
-                (top - CONTROL) * 0.5,
-                compact_x + CONTROL,
-                (top + CONTROL) * 0.5,
-            ),
-            if compact {
-                Icon::ArrowsOutSimple
-            } else {
-                Icon::ArrowsInSimple
-            },
-            Action::Compact,
-            true,
-        );
-        let bypass_x = compact_x - GAP - p.advance("Bypass", Face::Label).ceil() - INSET;
-        p.chip(
-            bypass_x,
-            (top - CONTROL) * 0.5,
-            "Bypass",
-            Action::Bypass,
-            self.settings.controls.correction == CorrectionMode::Bypass,
-            true,
-        );
-        let transport_x = bypass_x - GAP - p.advance(transport_label, Face::Label).ceil() - INSET;
         let has_correction = !matches!(self.active.correction.origin, Origin::Identity);
         let named_preset = self.settings.presets.get(&self.active.hash);
-        let can_save = has_correction && named_preset.is_none();
-        let status_gap = if can_save { 36.0 } else { GAP };
-        let preset_end = if compact {
-            bypass_x - GAP
-        } else {
-            (x + 260.0).min(transport_x - GAP - status_gap - p.advance(&status, Face::Stat).ceil())
-        };
         let preset_name = match named_preset {
-            Some(name) => std::borrow::Cow::Borrowed(name.as_str()),
-            None if has_correction => {
-                std::borrow::Cow::Borrowed(self.active.correction.name.as_str())
-            }
-            None => std::borrow::Cow::Borrowed("Choose preset..."),
+            Some(name) => name.as_str(),
+            None if has_correction => self.active.correction.name.as_str(),
+            None => "Choose preset...",
         };
-        p.titlebar_selector(
-            Rect::new(x, (top - CONTROL) * 0.5, preset_end, (top + CONTROL) * 0.5),
-            &preset_name,
-            Action::PresetPicker,
-            matches!(
-                self.picker.as_ref().map(|picker| picker.kind),
-                Some(PickerKind::Presets)
-            ),
+        let presets_open = matches!(
+            self.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Presets)
         );
-        if !compact {
-            if can_save {
+        match &full {
+            None => {
+                let band_y = (chrome.height - CONTROL) * 0.5;
+                let compact_x = window.x1 - INSET - CONTROL;
                 p.ghost_icon(
-                    Rect::new(
-                        preset_end + 4.0,
-                        (top - CONTROL) * 0.5,
-                        preset_end + 28.0,
-                        (top + CONTROL) * 0.5,
-                    ),
-                    Icon::FloppyDisk,
-                    Action::SavePreset,
+                    Rect::new(compact_x, band_y, compact_x + CONTROL, band_y + CONTROL),
+                    Icon::ArrowsOutSimple,
+                    Action::Compact,
                     true,
                 );
+                let gear_x = compact_x - GAP - CONTROL;
+                p.ghost_icon(
+                    Rect::new(gear_x, band_y, gear_x + CONTROL, band_y + CONTROL),
+                    Icon::GearSix,
+                    Action::Preferences,
+                    true,
+                );
+                let bypass_x = gear_x - GAP - p.advance("Bypass", Face::Label).ceil() - INSET;
+                p.chip(
+                    bypass_x,
+                    band_y,
+                    "Bypass",
+                    Action::Bypass,
+                    self.settings.controls.correction == CorrectionMode::Bypass,
+                    true,
+                );
+                p.titlebar_selector(
+                    Rect::new(
+                        chrome.controls_end + GAP,
+                        band_y,
+                        bypass_x - GAP,
+                        band_y + CONTROL,
+                    ),
+                    preset_name,
+                    Action::PresetPicker,
+                    presets_open,
+                );
             }
-            p.button(
-                transport_x,
-                (top - CONTROL) * 0.5,
-                transport_label,
-                Action::StartStop,
-                transport_enabled,
-            );
-            p.text(
-                &status,
-                Rect::new(preset_end + status_gap, 0.0, transport_x - GAP, top),
-                Face::Stat,
-                Align::End,
-                match self.lifecycle {
-                    Lifecycle::Running { .. } => match self.settings.controls.correction {
-                        CorrectionMode::On => colors.basic[2],
-                        CorrectionMode::Bypass => colors.basic[1],
+            Some(g) => {
+                let (x0, x1) = draw_header(
+                    &mut p,
+                    g.header,
+                    chrome,
+                    HeaderParts {
+                        mode: Mode::Listen,
+                        switchable: true,
+                        tools: &[
+                            (Icon::GearSix, Action::Preferences, true),
+                            (Icon::ArrowsInSimple, Action::Compact, true),
+                        ],
+                        correction: self.settings.controls.correction,
+                        bypass_enabled: true,
+                        transport: (
+                            if running {
+                                Transport::Pause
+                            } else {
+                                Transport::Play
+                            },
+                            Action::StartStop,
+                            running || self.settings.route.is_some(),
+                        ),
                     },
-                    Lifecycle::Failed(_) => colors.basic[1],
-                    _ => colors.secondary,
-                },
-            );
+                );
+                let mut x = x0;
+                for recent in &self.settings.recent {
+                    if x + RECENT_WIDTH > x1 {
+                        break;
+                    }
+                    p.profile_tile(
+                        g.header.fat(x, x + RECENT_WIDTH),
+                        self.settings
+                            .presets
+                            .get(&recent.hash)
+                            .unwrap_or(&recent.name),
+                        self.shapes.get(&recent.hash).and_then(Option::as_ref),
+                        Action::LoadSaved(recent.hash),
+                        recent.hash == self.active.hash,
+                    );
+                    x += RECENT_WIDTH + GAP;
+                }
+            }
         }
         if let Some(g) = &full {
             p.rect(g.sidebar, colors.body);
@@ -3379,131 +3516,241 @@ impl App {
                 Rect::new(SIDEBAR, top, SIDEBAR + RULE, g.status.y0),
                 colors.pane(),
             );
-            if !self.browser.is_preferences() {
-                p.button(
-                    150.0,
-                    top + 12.0,
-                    "Room",
-                    Action::Room(room::Action::Open),
-                    true,
-                );
-                p.section(
-                    Rect::new(0.0, top + 12.0, 145.0, top + 36.0),
-                    Icon::Headphones,
-                    "Headphones",
-                    colors.secondary,
-                );
-                p.ghost_icon(
-                    Rect::new(SIDEBAR - 40.0, top + 12.0, SIDEBAR - INSET, top + 36.0),
-                    Icon::ArrowsClockwise,
-                    Action::RefreshCatalog,
-                    self.job.is_none(),
-                );
-                let matches: Vec<_> = self
-                    .catalog
-                    .as_ref()
-                    .map(|catalog| {
-                        catalog
-                            .filtered(self.filter.text(), self.settings.catalog_filter)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let count = matches.len();
-                let listing = g.listing;
-                let row_height = Layout::RESULT_HEIGHT;
-                let result = |row: usize| {
-                    Rect::new(
-                        listing.x0,
-                        listing.y0 + row as f64 * row_height,
-                        listing.x1,
-                        listing.y0 + (row + 1) as f64 * row_height,
+            let mut tab_x = INSET;
+            for (label, action, browser) in [
+                ("Catalog", Action::BrowseCatalog, Browser::Catalog),
+                ("Presets", Action::BrowsePresets, Browser::Presets),
+            ] {
+                tab_x =
+                    p.chip(
+                        tab_x,
+                        top + 12.0,
+                        label,
+                        action,
+                        self.browser == browser,
+                        true,
                     )
-                };
-                let max_scroll = (count as f64 * row_height - listing.height()).max(0.0);
-                self.scroll = self.scroll.clamp(0.0, max_scroll);
-                let first = (self.scroll / row_height).floor() as usize;
-                let offset = self.scroll % row_height;
-                let visible = ((listing.height() + offset) / row_height).ceil() as usize;
-                self.filter_layout = Some(p.field(
-                    Rect::new(INSET, top + 52.0, SIDEBAR - INSET, top + 76.0),
-                    &self.filter,
-                    &count.to_string(),
-                    [Action::Search, Action::ClearSearch],
-                    matches!(self.text_focus, Some(TextFocus::Search)),
-                    "Search headphones...",
-                ));
-                p.button(
-                    INSET,
-                    top + 84.0,
-                    "Import WAV...",
-                    Action::Import,
-                    self.job.is_none(),
-                );
-                if self.job.is_some() {
-                    p.text(
-                        "Preparing...",
-                        Rect::new(142.0, top + 84.0, SIDEBAR - INSET, top + 108.0),
-                        Face::Small,
-                        Align::End,
-                        colors.secondary,
+                    .x1 + GAP;
+            }
+            match self.browser {
+                Browser::Catalog => {
+                    p.ghost_icon(
+                        Rect::new(SIDEBAR - 40.0, top + 12.0, SIDEBAR - INSET, top + 36.0),
+                        Icon::ArrowsClockwise,
+                        Action::RefreshCatalog,
+                        self.job.is_none(),
                     );
-                }
-                if self.browser == Browser::Catalog {
+                    let matches: Vec<_> = self
+                        .catalog
+                        .as_ref()
+                        .map(|catalog| {
+                            catalog
+                                .filtered(self.filter.text(), self.settings.catalog_filter)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let count = matches.len();
+                    let listing = g.listing;
+                    let row_height = Layout::RESULT_HEIGHT;
+                    let result = |row: usize| {
+                        Rect::new(
+                            listing.x0,
+                            listing.y0 + row as f64 * row_height,
+                            listing.x1,
+                            listing.y0 + (row + 1) as f64 * row_height,
+                        )
+                    };
+                    let max_scroll = (count as f64 * row_height - listing.height()).max(0.0);
+                    self.scroll = self.scroll.clamp(0.0, max_scroll);
+                    let first = (self.scroll / row_height).floor() as usize;
+                    let offset = self.scroll % row_height;
+                    let visible = ((listing.height() + offset) / row_height).ceil() as usize;
+                    self.filter_layout = Some(p.field(
+                        Rect::new(INSET, top + 52.0, SIDEBAR - INSET, top + 76.0),
+                        &self.filter,
+                        &count.to_string(),
+                        [Action::Search, Action::ClearSearch],
+                        matches!(self.text_focus, Some(TextFocus::Search)),
+                        "Search headphones...",
+                    ));
+                    p.button(
+                        INSET,
+                        top + 84.0,
+                        "Import WAV...",
+                        Action::Import,
+                        self.job.is_none(),
+                    );
+                    if self.job.is_some() {
+                        p.text(
+                            "Preparing...",
+                            Rect::new(142.0, top + 84.0, SIDEBAR - INSET, top + 108.0),
+                            Face::Small,
+                            Align::End,
+                            colors.secondary,
+                        );
+                    }
                     p.dropdown(
                         Rect::new(INSET, top + 116.0, SIDEBAR - INSET, top + 140.0),
                         self.settings.catalog_filter.label(),
                         Action::CatalogFilter,
                         self.catalog.as_ref().is_some_and(Catalog::inventory_known),
                     );
-                }
-                let list_hits = p.hits.len();
-                p.scene.push_clip_layer(
-                    vello::peniko::Fill::NonZero,
-                    vello::kurbo::Affine::scale(scale),
-                    &listing,
-                );
-                for (row, &(index, entry)) in matches.iter().skip(first).take(visible).enumerate() {
-                    p.list_row(
-                        result(row) + Vec2::new(0.0, -offset),
-                        &format!(
-                            "{}{}",
-                            entry.name,
-                            if entry.recommended { " *" } else { "" }
-                        ),
-                        &entry.source,
-                        Action::Select(index),
-                        self.selected
-                            .as_ref()
-                            .is_some_and(|selected| selected.source == Selection::Catalog(index)),
+                    let list_hits = p.hits.len();
+                    p.scene.push_clip_layer(
+                        vello::peniko::Fill::NonZero,
+                        vello::kurbo::Affine::scale(scale),
+                        &listing,
                     );
-                }
-                if count == 0 {
+                    for (row, &(index, entry)) in
+                        matches.iter().skip(first).take(visible).enumerate()
+                    {
+                        p.list_row(
+                            result(row) + Vec2::new(0.0, -offset),
+                            &format!(
+                                "{}{}",
+                                entry.name,
+                                if entry.recommended { " *" } else { "" }
+                            ),
+                            &entry.source,
+                            Action::Select(index),
+                            self.selected.as_ref().is_some_and(|selected| {
+                                selected.source == Selection::Catalog(index)
+                            }),
+                        );
+                    }
+                    if count == 0 {
+                        p.text(
+                            if self.catalog.is_some() {
+                                "No matching headphones"
+                            } else {
+                                "Refresh to load the library"
+                            },
+                            Rect::new(INSET, listing.y0, SIDEBAR - INSET, listing.y0 + ROW),
+                            Face::Label,
+                            Align::Start,
+                            colors.secondary,
+                        );
+                    }
+                    p.scene.pop_layer();
+                    for (bounds, _) in &mut p.hits[list_hits..] {
+                        *bounds = bounds.intersect(listing);
+                    }
+                    if let Some(bar) =
+                        Scrollbar::new(listing, count as f64 * row_height, self.scroll)
+                    {
+                        p.scrollbar(bar, Action::Scroll(ScrollSurface::Sidebar, bar));
+                    }
                     p.text(
-                        if self.catalog.is_some() {
-                            "No matching headphones"
-                        } else {
-                            "Refresh to load the library"
-                        },
-                        Rect::new(INSET, listing.y0, SIDEBAR - INSET, listing.y0 + ROW),
-                        Face::Label,
+                        &format!("{count} matches / * recommended"),
+                        Rect::new(INSET, g.status.y0 - 30.0, SIDEBAR - INSET, g.status.y0),
+                        Face::Small,
                         Align::Start,
                         colors.secondary,
                     );
                 }
-                p.scene.pop_layer();
-                for (bounds, _) in &mut p.hits[list_hits..] {
-                    *bounds = bounds.intersect(listing);
+                Browser::Presets => {
+                    let terms: Vec<_> = self
+                        .filter
+                        .text()
+                        .split_whitespace()
+                        .map(str::to_lowercase)
+                        .collect();
+                    let saved: Vec<_> = self
+                        .settings
+                        .presets
+                        .iter()
+                        .filter(|(_, name)| {
+                            terms.iter().all(|term| name.to_lowercase().contains(term))
+                        })
+                        .collect();
+                    let count = saved.len();
+                    self.filter_layout = Some(p.field(
+                        Rect::new(INSET, top + 52.0, SIDEBAR - INSET, top + 76.0),
+                        &self.filter,
+                        &count.to_string(),
+                        [Action::Search, Action::ClearSearch],
+                        matches!(self.text_focus, Some(TextFocus::Search)),
+                        "Search presets...",
+                    ));
+                    if has_correction {
+                        p.button(
+                            INSET,
+                            top + 84.0,
+                            if named_preset.is_some() {
+                                "Rename current preset..."
+                            } else {
+                                "Save loaded IR as preset..."
+                            },
+                            Action::SavePreset,
+                            true,
+                        );
+                    } else {
+                        p.text(
+                            "Load an IR to create a preset",
+                            Rect::new(INSET, top + 84.0, SIDEBAR - INSET, top + 108.0),
+                            Face::Small,
+                            Align::Start,
+                            colors.secondary,
+                        );
+                    }
+                    let listing = Rect::new(0.0, top + 116.0, SIDEBAR, g.listing.y1);
+                    self.scroll = self
+                        .scroll
+                        .clamp(0.0, (count as f64 * ROW - listing.height()).max(0.0));
+                    let first = (self.scroll / ROW).floor() as usize;
+                    let offset = self.scroll % ROW;
+                    let visible = ((listing.height() + offset) / ROW).ceil() as usize;
+                    let first_hit = p.hits.len();
+                    p.scene.push_clip_layer(
+                        vello::peniko::Fill::NonZero,
+                        vello::kurbo::Affine::scale(scale),
+                        &listing,
+                    );
+                    for (row, &(hash, name)) in saved.iter().skip(first).take(visible).enumerate() {
+                        let y = listing.y0 + row as f64 * ROW - offset;
+                        let bounds = Rect::new(0.0, y, SIDEBAR, y + ROW);
+                        p.list_item(
+                            bounds,
+                            name,
+                            Action::Recall(*hash),
+                            match self.selected.as_ref().map(|selected| &selected.source) {
+                                Some(Selection::Saved(selected)) => selected == hash,
+                                _ => self.active.hash == *hash,
+                            },
+                            &[
+                                (Icon::PencilSimple, Action::RenamePreset(*hash)),
+                                (Icon::X, Action::DeletePreset(*hash)),
+                            ],
+                        );
+                    }
+                    if count == 0 {
+                        p.text(
+                            if self.settings.presets.is_empty() {
+                                "No presets yet"
+                            } else {
+                                "No matching presets"
+                            },
+                            Rect::new(INSET, listing.y0, SIDEBAR - INSET, listing.y0 + CONTROL),
+                            Face::Label,
+                            Align::Start,
+                            colors.secondary,
+                        );
+                    }
+                    p.scene.pop_layer();
+                    for (bounds, _) in &mut p.hits[first_hit..] {
+                        *bounds = bounds.intersect(listing);
+                    }
+                    if let Some(bar) = Scrollbar::new(listing, count as f64 * ROW, self.scroll) {
+                        p.scrollbar(bar, Action::Scroll(ScrollSurface::Sidebar, bar));
+                    }
+                    p.text(
+                        &format!("{count} presets / pencil to rename / X to remove"),
+                        Rect::new(INSET, g.status.y0 - 30.0, SIDEBAR - INSET, g.status.y0),
+                        Face::Small,
+                        Align::Start,
+                        colors.secondary,
+                    );
                 }
-                if let Some(bar) = Scrollbar::new(listing, count as f64 * row_height, self.scroll) {
-                    p.scrollbar(bar, Action::Scroll(ScrollSurface::Sidebar, bar));
-                }
-                p.text(
-                    &format!("{count} matches / * recommended"),
-                    Rect::new(INSET, g.status.y0 - 30.0, SIDEBAR - INSET, g.status.y0),
-                    Face::Small,
-                    Align::Start,
-                    colors.secondary,
-                );
             }
             p.section(
                 g.section(top + 4.0),
@@ -3697,7 +3944,11 @@ impl App {
         }
         {
             let g = &graph;
-            p.rounded(g.graph, if compact { 0.0 } else { RADIUS }, colors.bg);
+            p.rounded(
+                g.graph,
+                if full.is_none() { 0.0 } else { RADIUS },
+                colors.bg,
+            );
             let max_hz = *self.active.response[0]
                 .frequency
                 .last()
@@ -3976,6 +4227,18 @@ impl App {
                 f64::from((self.settings.controls.volume.db() + 80.0) / 80.0),
                 Action::ValueBar(ValueBar::Volume),
             );
+            p.value_bar(
+                g.headroom(),
+                "Clip safety",
+                &format!(
+                    "{:.0}% / {:+.1} of {:+.1} dB",
+                    self.settings.controls.headroom.percent(),
+                    view.analysis.headroom_db,
+                    view.analysis.safety_db,
+                ),
+                f64::from(self.settings.controls.headroom.fraction()),
+                Action::ValueBar(ValueBar::HeadroomFollow),
+            );
             let trim_y = g.listening_row(1).y0 + 3.0;
             p.text(
                 "Comparison trim",
@@ -4048,8 +4311,8 @@ impl App {
             );
             p.text(
                 &format!(
-                    "Loaded headroom {:+.1} dB",
-                    self.active.analysis.headroom_db
+                    "Loaded headroom {:+.1} of {:+.1} dB",
+                    self.active.analysis.headroom_db, self.active.analysis.safety_db
                 ),
                 Rect::new(
                     g.main.x0 + 132.0,
@@ -4084,13 +4347,14 @@ impl App {
                         view.analysis.max_boost_db
                     ),
                     format!(
-                        "{}: headroom {:+.1} / wet {:+.1} / dry {:+.1} dB{}",
+                        "{}: headroom {:+.1} of {:+.1} / wet {:+.1} / dry {:+.1} dB{}",
                         if self.preview.is_some() {
                             "Preview"
                         } else {
                             "Active"
                         },
                         view.analysis.headroom_db,
+                        view.analysis.safety_db,
                         view.analysis.wet_db,
                         view.analysis.dry_db,
                         match self.lifecycle {
@@ -4121,9 +4385,17 @@ impl App {
                 }
             }
             p.rect(g.status, colors.bg);
+            let status_x = g.status.x1 - INSET - p.advance(&status, Face::Small).ceil();
+            p.text(
+                &status,
+                Rect::new(status_x, g.status.y0, g.status.x1 - INSET, g.status.y1),
+                Face::Small,
+                Align::End,
+                status_ink,
+            );
             p.text(
                 &self.message,
-                Rect::new(INSET, g.status.y0, g.status.x1 - INSET, g.status.y1),
+                Rect::new(INSET, g.status.y0, status_x - INSET, g.status.y1),
                 Face::Small,
                 Align::Start,
                 if matches!(self.lifecycle, Lifecycle::Failed(_)) {
@@ -4133,14 +4405,13 @@ impl App {
                 },
             );
         }
-        if self.browser.is_preferences() {
-            let panel_bottom = full.as_ref().map_or(window.y1, |layout| layout.status.y0);
-            let pane = Rect::new(0.0, top, SIDEBAR, panel_bottom);
+        if let Some(page) = self.preferences {
+            let panel_bottom = pane.y1;
             p.hits
                 .retain(|(bounds, _)| bounds.y1 <= top || bounds.intersect(pane).area() == 0.0);
             p.rect(pane, colors.body);
             p.rect(
-                Rect::new(SIDEBAR, top, SIDEBAR + RULE, panel_bottom),
+                Rect::new(pane.x0 - RULE, top, pane.x0, panel_bottom),
                 colors.pane(),
             );
             let tabs = [
@@ -4148,461 +4419,368 @@ impl App {
                     "General",
                     Icon::GearSix,
                     Action::BrowseGeneral,
-                    Browser::General,
+                    PreferencePage::General,
                 ),
                 (
                     "IR settings",
                     Icon::SlidersHorizontal,
                     Action::BrowseGeneration,
-                    Browser::Generation,
+                    PreferencePage::Generation,
                 ),
                 (
                     "Spectrum",
                     Icon::Waveform,
                     Action::BrowseSpectrum,
-                    Browser::Spectrum,
-                ),
-                (
-                    "Presets",
-                    Icon::FloppyDisk,
-                    Action::BrowsePresets,
-                    Browser::Presets,
+                    PreferencePage::Spectrum,
                 ),
             ];
-            let tab_width = SIDEBAR / tabs.len() as f64;
+            let tab_width = pane.width() / tabs.len() as f64;
             for (i, (label, icon, action, page)) in tabs.into_iter().enumerate() {
-                let x = i as f64 * tab_width;
+                let x = pane.x0 + i as f64 * tab_width;
                 p.tab(
                     Rect::new(x, top, x + tab_width, top + 48.0),
                     icon,
                     label,
                     action,
-                    self.browser == page,
+                    self.preferences == Some(page),
                 );
             }
             p.rect(
-                Rect::new(0.0, top + 48.0, SIDEBAR, top + 48.0 + RULE),
+                Rect::new(pane.x0, top + 48.0, pane.x1, top + 48.0 + RULE),
                 colors.pane(),
             );
-            if self.browser == Browser::Generation {
-                let content = Rect::new(0.0, top + 60.0, SIDEBAR, panel_bottom - 12.0);
-                let settings = self.settings.generation;
-                let parameters: Vec<_> = GenerationParameter::ALL
-                    .into_iter()
-                    .filter(|parameter| match parameter {
-                        GenerationParameter::HighFull | GenerationParameter::HighUnity => {
-                            settings.treble() == TrebleExtension::Limited
-                        }
-                        GenerationParameter::LowFull | GenerationParameter::LowUnity => {
-                            settings.bass() == BassExtension::Tapered
-                        }
-                        GenerationParameter::CutLimit => settings.cut_limit().is_some(),
-                        _ => true,
-                    })
-                    .collect();
-                let height = 8.0 * 32.0 + parameters.len() as f64 * 32.0 + 112.0;
-                let max_scroll = (height - content.height()).max(0.0);
-                self.scroll = self.scroll.clamp(0.0, max_scroll);
-                let first_hit = p.hits.len();
-                p.scene.push_clip_layer(
-                    vello::peniko::Fill::NonZero,
-                    vello::kurbo::Affine::scale(scale),
-                    &content,
-                );
-                let mut y = content.y0 - self.scroll;
-                for (label, value, action) in [
-                    (
-                        "FIR length",
-                        format!("{} taps", settings.length().frames()),
-                        Action::GenerationLength,
-                    ),
-                    (
-                        "Alignment",
-                        settings.alignment().label().into(),
-                        Action::GenerationAlignment,
-                    ),
-                    (
-                        "Output gain",
-                        settings.normalization().label().into(),
-                        Action::GenerationNormalization,
-                    ),
-                ] {
-                    p.text(
-                        label,
-                        Rect::new(INSET, y, 132.0, y + CONTROL),
-                        Face::Label,
-                        Align::Start,
-                        colors.fg,
+            match page {
+                PreferencePage::Generation => {
+                    let content = Rect::new(pane.x0, top + 60.0, pane.x1, panel_bottom - 12.0);
+                    let settings = self.settings.generation;
+                    let parameters: Vec<_> = GenerationParameter::ALL
+                        .into_iter()
+                        .filter(|parameter| match parameter {
+                            GenerationParameter::HighFull | GenerationParameter::HighUnity => {
+                                settings.treble() == TrebleExtension::Limited
+                            }
+                            GenerationParameter::LowFull | GenerationParameter::LowUnity => {
+                                settings.bass() == BassExtension::Tapered
+                            }
+                            GenerationParameter::CutLimit => settings.cut_limit().is_some(),
+                            _ => true,
+                        })
+                        .collect();
+                    let height = 8.0 * 32.0 + parameters.len() as f64 * 32.0 + 112.0;
+                    let max_scroll = (height - content.height()).max(0.0);
+                    self.preference_scroll = self.preference_scroll.clamp(0.0, max_scroll);
+                    let first_hit = p.hits.len();
+                    p.scene.push_clip_layer(
+                        vello::peniko::Fill::NonZero,
+                        vello::kurbo::Affine::scale(scale),
+                        &content,
                     );
-                    p.dropdown(
-                        Rect::new(132.0, y, SIDEBAR - INSET, y + CONTROL),
-                        &value,
-                        action,
+                    let mut y = content.y0 - self.preference_scroll;
+                    for (label, value, action) in [
+                        (
+                            "FIR length",
+                            format!("{} taps", settings.length().frames()),
+                            Action::GenerationLength,
+                        ),
+                        (
+                            "Alignment",
+                            settings.alignment().label().into(),
+                            Action::GenerationAlignment,
+                        ),
+                        (
+                            "Output gain",
+                            settings.normalization().label().into(),
+                            Action::GenerationNormalization,
+                        ),
+                    ] {
+                        p.text(
+                            label,
+                            Rect::new(pane.x0 + INSET, y, pane.x0 + 132.0, y + CONTROL),
+                            Face::Label,
+                            Align::Start,
+                            colors.fg,
+                        );
+                        p.dropdown(
+                            Rect::new(pane.x0 + 132.0, y, pane.x1 - INSET, y + CONTROL),
+                            &value,
+                            action,
+                            true,
+                        );
+                        y += 32.0;
+                    }
+                    p.chip(
+                        pane.x0 + INSET,
+                        y,
+                        "Extend treble (AutoEq)",
+                        Action::TrebleExtension,
+                        settings.treble() == TrebleExtension::AutoEq,
                         true,
                     );
                     y += 32.0;
-                }
-                p.chip(
-                    INSET,
-                    y,
-                    "Extend treble (AutoEq)",
-                    Action::TrebleExtension,
-                    settings.treble() == TrebleExtension::AutoEq,
-                    true,
-                );
-                y += 32.0;
-                for (label, action, selected) in [
-                    (
-                        "Taper bass",
-                        Action::GenerationBass,
-                        settings.bass() == BassExtension::Tapered,
-                    ),
-                    (
-                        "Limit cuts",
-                        Action::GenerationCutLimit,
-                        settings.cut_limit().is_some(),
-                    ),
-                    (
-                        "Concha interference",
-                        Action::GenerationConcha,
-                        settings.concha() == ConchaInterference::Present,
-                    ),
-                ] {
-                    p.chip(INSET, y, label, action, selected, true);
-                    y += 32.0;
-                }
-                for parameter in parameters {
-                    let label = parameter.label();
-                    p.text(
-                        label,
-                        Rect::new(INSET, y, 132.0, y + CONTROL),
-                        Face::Label,
-                        Align::Start,
-                        colors.fg,
+                    for (label, action, selected) in [
+                        (
+                            "Taper bass",
+                            Action::GenerationBass,
+                            settings.bass() == BassExtension::Tapered,
+                        ),
+                        (
+                            "Limit cuts",
+                            Action::GenerationCutLimit,
+                            settings.cut_limit().is_some(),
+                        ),
+                        (
+                            "Concha interference",
+                            Action::GenerationConcha,
+                            settings.concha() == ConchaInterference::Present,
+                        ),
+                    ] {
+                        p.chip(pane.x0 + INSET, y, label, action, selected, true);
+                        y += 32.0;
+                    }
+                    for parameter in parameters {
+                        let label = parameter.label();
+                        p.text(
+                            label,
+                            Rect::new(pane.x0 + INSET, y, pane.x0 + 132.0, y + CONTROL),
+                            Face::Label,
+                            Align::Start,
+                            colors.fg,
+                        );
+                        let target = NumberField::Generation(parameter);
+                        let value = settings.value(parameter);
+                        let formatted = if value < 5.0 {
+                            format!("{value:.3}")
+                        } else {
+                            format!("{value:.0}")
+                        };
+                        Self::draw_number(
+                            &mut p,
+                            Rect::new(pane.x0 + 132.0, y, pane.x1 - INSET, y + CONTROL),
+                            target,
+                            &formatted,
+                            &mut self.text_focus,
+                        );
+                        y += 32.0;
+                    }
+                    p.button(
+                        pane.x0 + INSET,
+                        y,
+                        "Restore defaults",
+                        Action::GenerationDefaults,
+                        settings != settings.reset_parameters()
+                            || self
+                                .preview
+                                .as_ref()
+                                .map_or(&self.active, |(view, _)| view)
+                                .correction
+                                .requires_regeneration(),
                     );
-                    let target = NumberField::Generation(parameter);
-                    let value = settings.value(parameter);
-                    let formatted = if value < 5.0 {
-                        format!("{value:.3}")
-                    } else {
-                        format!("{value:.0}")
-                    };
+                    y += 40.0;
+                    for text in [
+                        "Applies to in-app target modes.",
+                        "Edits prepare a comparison preview.",
+                        "Stored presets keep their current audio.",
+                        "Replace loaded applies the preview.",
+                    ] {
+                        p.text(
+                            text,
+                            Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + 20.0),
+                            Face::Small,
+                            Align::Start,
+                            colors.secondary,
+                        );
+                        y += 20.0;
+                    }
+                    p.scene.pop_layer();
+                    for (bounds, _) in &mut p.hits[first_hit..] {
+                        *bounds = bounds.intersect(content);
+                    }
+                    if let Some(bar) = Scrollbar::new(content, height, self.preference_scroll) {
+                        p.scrollbar(bar, Action::Scroll(ScrollSurface::Preferences, bar));
+                    }
+                }
+                PreferencePage::Spectrum => {
+                    let content = Rect::new(pane.x0, top + 60.0, pane.x1, panel_bottom - 12.0);
+                    let height = 424.0;
+                    self.preference_scroll = self
+                        .preference_scroll
+                        .clamp(0.0, (height - content.height()).max(0.0));
+                    let first_hit = p.hits.len();
+                    p.scene.push_clip_layer(
+                        vello::peniko::Fill::NonZero,
+                        vello::kurbo::Affine::scale(scale),
+                        &content,
+                    );
+                    let mut y = content.y0 - self.preference_scroll;
+                    p.toggle(
+                        Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + ROW),
+                        "Live spectrum backdrop",
+                        Action::SpectrumEnabled,
+                        self.settings.spectrum.enabled,
+                        true,
+                    );
+                    y += 40.0;
+                    for setting in SpectrumSetting::ALL {
+                        p.text(
+                            setting.label(),
+                            Rect::new(pane.x0 + INSET, y, pane.x0 + 108.0, y + CONTROL),
+                            Face::Label,
+                            Align::Start,
+                            colors.fg,
+                        );
+                        p.dropdown(
+                            Rect::new(pane.x0 + 108.0, y, pane.x1 - INSET, y + CONTROL),
+                            &self.settings.spectrum.selected(setting).label(),
+                            Action::SpectrumPicker(setting),
+                            true,
+                        );
+                        y += 36.0;
+                    }
+                    p.value_bar(
+                        Rect::new(pane.x0 + INSET, y, pane.x1 - 124.0, y + CONTROL),
+                        "Intensity",
+                        "",
+                        f64::from(self.settings.spectrum.intensity.alpha()),
+                        Action::ValueBar(ValueBar::SpectrumIntensity),
+                    );
                     Self::draw_number(
                         &mut p,
-                        Rect::new(132.0, y, SIDEBAR - INSET, y + CONTROL),
-                        target,
-                        &formatted,
+                        Rect::new(pane.x1 - 116.0, y, pane.x1 - INSET, y + CONTROL),
+                        NumberField::SpectrumIntensity,
+                        &format!("{:.1}%", self.settings.spectrum.intensity.percent()),
                         &mut self.text_focus,
                     );
+                    y += 36.0;
+                    y += 8.0;
+                    for text in [
+                        "Stereo average power / Hann window.",
+                        "Input: before IR, gain and bypass.",
+                        "Output: after IR, gain and bypass.",
+                        "Spectrum scale: dBFS on the right.",
+                        "IR curves retain their dB scale.",
+                        "Refresh target / display may limit FPS.",
+                        "Changes apply immediately.",
+                        "Analysis pauses while hidden.",
+                    ] {
+                        p.text(
+                            text,
+                            Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + 20.0),
+                            Face::Small,
+                            Align::Start,
+                            colors.secondary,
+                        );
+                        y += 20.0;
+                    }
+                    p.scene.pop_layer();
+                    for (bounds, _) in &mut p.hits[first_hit..] {
+                        *bounds = bounds.intersect(content);
+                    }
+                    if let Some(bar) = Scrollbar::new(content, height, self.preference_scroll) {
+                        p.scrollbar(bar, Action::Scroll(ScrollSurface::Preferences, bar));
+                    }
+                }
+                PreferencePage::General => {
+                    let slots: &[ThemeSlot] = if self.settings.appearance.mode == ThemeMode::System
+                    {
+                        &[ThemeSlot::Light, ThemeSlot::Dark]
+                    } else {
+                        &[ThemeSlot::Fixed]
+                    };
+                    let content = Rect::new(pane.x0, top + 60.0, pane.x1, panel_bottom - 12.0);
+                    let status = self.login.as_ref().ok().copied();
+                    let needs_settings = status.is_some_and(login::Status::needs_settings);
+                    let height =
+                        156.0 + slots.len() as f64 * 62.0 + if needs_settings { 36.0 } else { 0.0 };
+                    let max_scroll = (height - content.height()).max(0.0);
+                    self.preference_scroll = self.preference_scroll.clamp(0.0, max_scroll);
+                    let first_hit = p.hits.len();
+                    p.scene.push_clip_layer(
+                        vello::peniko::Fill::NonZero,
+                        vello::kurbo::Affine::scale(scale),
+                        &content,
+                    );
+                    let mut y = content.y0 - self.preference_scroll;
+                    p.toggle(
+                        Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + ROW),
+                        "Launch at login",
+                        Action::LaunchAtLogin,
+                        status.is_some_and(login::Status::requested),
+                        status.and_then(login::Status::change).is_some(),
+                    );
                     y += 32.0;
-                }
-                p.button(
-                    INSET,
-                    y,
-                    "Restore defaults",
-                    Action::GenerationDefaults,
-                    settings != settings.reset_parameters()
-                        || self
-                            .preview
-                            .as_ref()
-                            .map_or(&self.active, |(view, _)| view)
-                            .correction
-                            .requires_regeneration(),
-                );
-                y += 40.0;
-                for text in [
-                    "Applies to in-app target modes.",
-                    "Edits prepare a comparison preview.",
-                    "Stored presets keep their current audio.",
-                    "Replace loaded applies the preview.",
-                ] {
+                    let caption = match &self.login {
+                        Ok(status) => status.caption(),
+                        Err(error) => error.as_str(),
+                    };
                     p.text(
-                        text,
-                        Rect::new(INSET, y, SIDEBAR - INSET, y + 20.0),
+                        caption,
+                        Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + 20.0),
                         Face::Small,
                         Align::Start,
                         colors.secondary,
                     );
-                    y += 20.0;
-                }
-                p.scene.pop_layer();
-                for (bounds, _) in &mut p.hits[first_hit..] {
-                    *bounds = bounds.intersect(content);
-                }
-                if let Some(bar) = Scrollbar::new(content, height, self.scroll) {
-                    p.scrollbar(bar, Action::Scroll(ScrollSurface::Sidebar, bar));
-                }
-            } else if self.browser == Browser::Spectrum {
-                let content = Rect::new(0.0, top + 60.0, SIDEBAR, panel_bottom - 12.0);
-                let height = 424.0;
-                self.scroll = self.scroll.clamp(0.0, (height - content.height()).max(0.0));
-                let first_hit = p.hits.len();
-                p.scene.push_clip_layer(
-                    vello::peniko::Fill::NonZero,
-                    vello::kurbo::Affine::scale(scale),
-                    &content,
-                );
-                let mut y = content.y0 - self.scroll;
-                p.toggle(
-                    Rect::new(INSET, y, SIDEBAR - INSET, y + ROW),
-                    "Live spectrum backdrop",
-                    Action::SpectrumEnabled,
-                    self.settings.spectrum.enabled,
-                    true,
-                );
-                y += 40.0;
-                for setting in SpectrumSetting::ALL {
+                    y += 28.0;
+                    if needs_settings {
+                        p.button(
+                            pane.x0 + INSET,
+                            y,
+                            "Open Login Items...",
+                            Action::LoginSettings,
+                            true,
+                        );
+                        y += 36.0;
+                    }
                     p.text(
-                        setting.label(),
-                        Rect::new(INSET, y, 108.0, y + CONTROL),
-                        Face::Label,
+                        "Appearance",
+                        Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + CONTROL),
+                        Face::Title,
                         Align::Start,
                         colors.fg,
                     );
-                    p.dropdown(
-                        Rect::new(108.0, y, SIDEBAR - INSET, y + CONTROL),
-                        &self.settings.spectrum.selected(setting).label(),
-                        Action::SpectrumPicker(setting),
+                    y += 32.0;
+                    p.toggle(
+                        Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + ROW),
+                        "Follow macOS light/dark",
+                        Action::FollowSystem,
+                        self.settings.appearance.mode == ThemeMode::System,
                         true,
                     );
-                    y += 36.0;
-                }
-                p.value_bar(
-                    Rect::new(INSET, y, SIDEBAR - 124.0, y + CONTROL),
-                    "Intensity",
-                    "",
-                    f64::from(self.settings.spectrum.intensity.alpha()),
-                    Action::ValueBar(ValueBar::SpectrumIntensity),
-                );
-                Self::draw_number(
-                    &mut p,
-                    Rect::new(SIDEBAR - 116.0, y, SIDEBAR - INSET, y + CONTROL),
-                    NumberField::SpectrumIntensity,
-                    &format!("{:.1}%", self.settings.spectrum.intensity.percent()),
-                    &mut self.text_focus,
-                );
-                y += 36.0;
-                y += 8.0;
-                for text in [
-                    "Stereo average power / Hann window.",
-                    "Input: before IR, gain and bypass.",
-                    "Output: after IR, gain and bypass.",
-                    "Spectrum scale: dBFS on the right.",
-                    "IR curves retain their dB scale.",
-                    "Refresh target / display may limit FPS.",
-                    "Changes apply immediately.",
-                    "Analysis pauses while hidden.",
-                ] {
+                    y += 40.0;
+                    for &slot in slots {
+                        p.text(
+                            slot.label(),
+                            Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + CONTROL),
+                            Face::Label,
+                            Align::Start,
+                            colors.fg,
+                        );
+                        y += 26.0;
+                        p.dropdown(
+                            Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + CONTROL),
+                            self.settings.appearance.theme(slot).name(),
+                            Action::ThemePicker(slot),
+                            true,
+                        );
+                        y += 36.0;
+                    }
                     p.text(
-                        text,
-                        Rect::new(INSET, y, SIDEBAR - INSET, y + 20.0),
+                        match self.system_appearance {
+                            Appearance::Light => "macOS currently uses light appearance.",
+                            Appearance::Dark => "macOS currently uses dark appearance.",
+                        },
+                        Rect::new(pane.x0 + INSET, y, pane.x1 - INSET, y + CONTROL),
                         Face::Small,
                         Align::Start,
                         colors.secondary,
                     );
-                    y += 20.0;
+                    p.scene.pop_layer();
+                    for (bounds, _) in &mut p.hits[first_hit..] {
+                        *bounds = bounds.intersect(content);
+                    }
+                    if let Some(bar) = Scrollbar::new(content, height, self.preference_scroll) {
+                        p.scrollbar(bar, Action::Scroll(ScrollSurface::Preferences, bar));
+                    }
                 }
-                p.scene.pop_layer();
-                for (bounds, _) in &mut p.hits[first_hit..] {
-                    *bounds = bounds.intersect(content);
-                }
-                if let Some(bar) = Scrollbar::new(content, height, self.scroll) {
-                    p.scrollbar(bar, Action::Scroll(ScrollSurface::Sidebar, bar));
-                }
-            } else if self.browser == Browser::General {
-                let slots: &[ThemeSlot] = if self.settings.appearance.mode == ThemeMode::System {
-                    &[ThemeSlot::Light, ThemeSlot::Dark]
-                } else {
-                    &[ThemeSlot::Fixed]
-                };
-                let content = Rect::new(0.0, top + 60.0, SIDEBAR, panel_bottom - 12.0);
-                let status = self.login.as_ref().ok().copied();
-                let needs_settings = status.is_some_and(login::Status::needs_settings);
-                let height =
-                    156.0 + slots.len() as f64 * 62.0 + if needs_settings { 36.0 } else { 0.0 };
-                let max_scroll = (height - content.height()).max(0.0);
-                self.scroll = self.scroll.clamp(0.0, max_scroll);
-                let first_hit = p.hits.len();
-                p.scene.push_clip_layer(
-                    vello::peniko::Fill::NonZero,
-                    vello::kurbo::Affine::scale(scale),
-                    &content,
-                );
-                let mut y = content.y0 - self.scroll;
-                p.toggle(
-                    Rect::new(INSET, y, SIDEBAR - INSET, y + ROW),
-                    "Launch at login",
-                    Action::LaunchAtLogin,
-                    status.is_some_and(login::Status::requested),
-                    status.and_then(login::Status::change).is_some(),
-                );
-                y += 32.0;
-                let caption = match &self.login {
-                    Ok(status) => status.caption(),
-                    Err(error) => error.as_str(),
-                };
-                p.text(
-                    caption,
-                    Rect::new(INSET, y, SIDEBAR - INSET, y + 20.0),
-                    Face::Small,
-                    Align::Start,
-                    colors.secondary,
-                );
-                y += 28.0;
-                if needs_settings {
-                    p.button(INSET, y, "Open Login Items...", Action::LoginSettings, true);
-                    y += 36.0;
-                }
-                p.text(
-                    "Appearance",
-                    Rect::new(INSET, y, SIDEBAR - INSET, y + CONTROL),
-                    Face::Title,
-                    Align::Start,
-                    colors.fg,
-                );
-                y += 32.0;
-                p.toggle(
-                    Rect::new(INSET, y, SIDEBAR - INSET, y + ROW),
-                    "Follow macOS light/dark",
-                    Action::FollowSystem,
-                    self.settings.appearance.mode == ThemeMode::System,
-                    true,
-                );
-                y += 40.0;
-                for &slot in slots {
-                    p.text(
-                        slot.label(),
-                        Rect::new(INSET, y, SIDEBAR - INSET, y + CONTROL),
-                        Face::Label,
-                        Align::Start,
-                        colors.fg,
-                    );
-                    y += 26.0;
-                    p.dropdown(
-                        Rect::new(INSET, y, SIDEBAR - INSET, y + CONTROL),
-                        self.settings.appearance.theme(slot).name(),
-                        Action::ThemePicker(slot),
-                        true,
-                    );
-                    y += 36.0;
-                }
-                p.text(
-                    match self.system_appearance {
-                        Appearance::Light => "macOS currently uses light appearance.",
-                        Appearance::Dark => "macOS currently uses dark appearance.",
-                    },
-                    Rect::new(INSET, y, SIDEBAR - INSET, y + CONTROL),
-                    Face::Small,
-                    Align::Start,
-                    colors.secondary,
-                );
-                p.scene.pop_layer();
-                for (bounds, _) in &mut p.hits[first_hit..] {
-                    *bounds = bounds.intersect(content);
-                }
-                if let Some(bar) = Scrollbar::new(content, height, self.scroll) {
-                    p.scrollbar(bar, Action::Scroll(ScrollSurface::Sidebar, bar));
-                }
-            } else {
-                let terms: Vec<_> = self
-                    .filter
-                    .text()
-                    .split_whitespace()
-                    .map(str::to_lowercase)
-                    .collect();
-                let saved: Vec<_> = self
-                    .settings
-                    .presets
-                    .iter()
-                    .filter(|(_, name)| terms.iter().all(|term| name.to_lowercase().contains(term)))
-                    .collect();
-                let count = saved.len();
-                self.filter_layout = Some(p.field(
-                    Rect::new(INSET, top + 60.0, SIDEBAR - INSET, top + 84.0),
-                    &self.filter,
-                    &count.to_string(),
-                    [Action::Search, Action::ClearSearch],
-                    matches!(self.text_focus, Some(TextFocus::Search)),
-                    "Search presets...",
-                ));
-                if has_correction {
-                    p.button(
-                        INSET,
-                        top + 92.0,
-                        if named_preset.is_some() {
-                            "Rename current preset..."
-                        } else {
-                            "Save loaded IR as preset..."
-                        },
-                        Action::SavePreset,
-                        true,
-                    );
-                } else {
-                    p.text(
-                        "Load an IR to create a preset",
-                        Rect::new(INSET, top + 92.0, SIDEBAR - INSET, top + 116.0),
-                        Face::Small,
-                        Align::Start,
-                        colors.secondary,
-                    );
-                }
-                let listing = Rect::new(0.0, top + 128.0, SIDEBAR, panel_bottom - 36.0);
-                self.scroll = self
-                    .scroll
-                    .clamp(0.0, (count as f64 * ROW - listing.height()).max(0.0));
-                let first = (self.scroll / ROW).floor() as usize;
-                let offset = self.scroll % ROW;
-                let visible = ((listing.height() + offset) / ROW).ceil() as usize;
-                let first_hit = p.hits.len();
-                p.scene.push_clip_layer(
-                    vello::peniko::Fill::NonZero,
-                    vello::kurbo::Affine::scale(scale),
-                    &listing,
-                );
-                for (row, &(hash, name)) in saved.iter().skip(first).take(visible).enumerate() {
-                    let y = listing.y0 + row as f64 * ROW - offset;
-                    let bounds = Rect::new(0.0, y, SIDEBAR, y + ROW);
-                    p.list_item(
-                        bounds,
-                        name,
-                        Action::Recall(*hash),
-                        match self.selected.as_ref().map(|selected| &selected.source) {
-                            Some(Selection::Saved(selected)) => selected == hash,
-                            _ => self.active.hash == *hash,
-                        },
-                        &[
-                            (Icon::PencilSimple, Action::RenamePreset(*hash)),
-                            (Icon::X, Action::DeletePreset(*hash)),
-                        ],
-                    );
-                }
-                if count == 0 {
-                    p.text(
-                        if self.settings.presets.is_empty() {
-                            "No presets yet"
-                        } else {
-                            "No matching presets"
-                        },
-                        Rect::new(INSET, listing.y0, SIDEBAR - INSET, listing.y0 + CONTROL),
-                        Face::Label,
-                        Align::Start,
-                        colors.secondary,
-                    );
-                }
-                p.scene.pop_layer();
-                for (bounds, _) in &mut p.hits[first_hit..] {
-                    *bounds = bounds.intersect(listing);
-                }
-                if let Some(bar) = Scrollbar::new(listing, count as f64 * ROW, self.scroll) {
-                    p.scrollbar(bar, Action::Scroll(ScrollSurface::Sidebar, bar));
-                }
-                p.text(
-                    &format!("{count} presets / pencil to rename / X to remove"),
-                    Rect::new(INSET, panel_bottom - 30.0, SIDEBAR - INSET, panel_bottom),
-                    Face::Small,
-                    Align::Start,
-                    colors.secondary,
-                );
             }
         }
         if let Some(TextFocus::PresetName {
@@ -4663,7 +4841,7 @@ impl App {
             );
         }
         let hint = if help_enabled {
-            help::target(&p.hits, self.cursor, self.browser.is_preferences())
+            help::target(&p.hits, self.cursor, self.preferences.map(|_| pane))
         } else {
             None
         };
@@ -4898,9 +5076,10 @@ impl ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,
                 ..
-            } if !self.room.opened
+            } if self.mode == Mode::Listen
                 && self.graph_geometry().graph.contains(self.cursor)
-                && !(self.browser.is_preferences() && self.cursor.x < SIDEBAR) =>
+                && !(self.preferences.is_some()
+                    && self.preference_pane(self.viewport()).contains(self.cursor)) =>
             {
                 if self.commit_number() {
                     self.text_focus = None;
@@ -4997,7 +5176,7 @@ impl ApplicationHandler for App {
                         None if self.picker.is_some() => {
                             self.dismiss_picker();
                         }
-                        None if self.cursor.y < self.window_chrome.expect("live chrome").height
+                        None if self.cursor.y < self.header_bottom()
                             && self.cursor.x
                                 >= self.window_chrome.expect("live chrome").controls_end =>
                         {
@@ -5030,7 +5209,7 @@ impl ApplicationHandler for App {
                 self.dirty = true;
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.room.opened && self.picker.is_none() {
+                if self.mode == Mode::Build && self.picker.is_none() {
                     let amount = match delta {
                         MouseScrollDelta::LineDelta(_, rows) => f64::from(rows) * ROW,
                         MouseScrollDelta::PixelDelta(p) => p.y / self.scale(),
@@ -5059,22 +5238,30 @@ impl ApplicationHandler for App {
                         self.dirty = true;
                     }
                 } else {
-                    let region = if self.browser.is_preferences() {
-                        Some(Rect::new(
-                            0.0,
-                            self.window_chrome.expect("live chrome").height + 60.0,
-                            SIDEBAR,
-                            self.viewport().height,
-                        ))
-                    } else if self.settings.window_mode == WindowMode::Full {
-                        Some(self.geometry().listing)
+                    let pane = self
+                        .preferences
+                        .map(|_| self.preference_pane(self.viewport()))
+                        .filter(|pane| pane.contains(self.cursor));
+                    let surface = if pane.is_some() {
+                        Some(ScrollSurface::Preferences)
+                    } else if self.settings.window_mode == WindowMode::Full
+                        && self.geometry().listing.contains(self.cursor)
+                    {
+                        Some(ScrollSurface::Sidebar)
                     } else {
                         None
                     };
-                    if region.is_some_and(|bounds| bounds.contains(self.cursor))
+                    if let Some(surface) = surface
                         && self.commit_number()
                     {
-                        self.scroll = (self.scroll - pixels).max(0.0);
+                        let offset = match surface {
+                            ScrollSurface::Preferences => &mut self.preference_scroll,
+                            ScrollSurface::Sidebar => &mut self.scroll,
+                            ScrollSurface::RoomSettings | ScrollSurface::Picker => {
+                                unreachable!("the wheel scrolls the sidebar or preferences here")
+                            }
+                        };
+                        *offset = (*offset - pixels).max(0.0);
                         self.dirty = true;
                     }
                 }
@@ -5085,7 +5272,9 @@ impl ApplicationHandler for App {
                     self.dirty = true;
                 }
             }
-            WindowEvent::Focused(true) if self.browser == Browser::General => self.refresh_login(),
+            WindowEvent::Focused(true) if self.preferences == Some(PreferencePage::General) => {
+                self.refresh_login()
+            }
             WindowEvent::Focused(false) => {
                 self.finish_drag();
                 self.pressed = None;
@@ -5178,7 +5367,7 @@ impl ApplicationHandler for App {
                         } else {
                             if self.text_focus.is_some() {
                                 self.text_focus = None;
-                            } else if self.browser.is_preferences() {
+                            } else if self.preferences.is_some() {
                                 self.action(Action::Preferences);
                             } else {
                                 self.action(Action::Cancel);
@@ -5271,7 +5460,7 @@ mod regression_tests {
     #[test]
     fn hiding_the_window_cancels_measurement_and_clears_pending_movement() {
         let (_directory, mut app) = emulated_app();
-        app.room.opened = true;
+        app.mode = Mode::Build;
         app.window_chrome = Some(WindowChrome {
             height: 32.0,
             controls_end: 81.0,
@@ -5299,7 +5488,7 @@ mod regression_tests {
     #[test]
     fn escape_stops_measurement_before_dismissing_its_dialog() {
         let (_directory, mut app) = emulated_app();
-        app.room.opened = true;
+        app.mode = Mode::Build;
         app.room.running = true;
         app.room.dialog = Some(room::Dialog::Verification);
         assert!(app.room_escape());
@@ -5312,7 +5501,7 @@ mod regression_tests {
     #[test]
     fn stop_ignores_invalid_numeric_text_and_cancels_measurement() {
         let (_directory, mut app) = emulated_app();
-        app.room.opened = true;
+        app.mode = Mode::Build;
         app.room.running = true;
         app.text_focus = Some(TextFocus::Number {
             target: NumberField::Room(room::Parameter::ProbeLevel),
@@ -5384,7 +5573,7 @@ mod regression_tests {
     #[test]
     fn save_shortcut_uses_room_candidate_and_rejects_missing_candidate() {
         let (_directory, mut app) = emulated_app();
-        app.room.opened = true;
+        app.mode = Mode::Build;
         app.action(Action::SavePreset);
         assert!(app.room.dialog.is_none());
         assert!(app.text_focus.is_none());
@@ -5409,24 +5598,24 @@ mod regression_tests {
     #[test]
     fn global_preferences_leave_room_and_search_never_creates_hidden_focus() {
         let (_directory, mut app) = emulated_app();
-        app.room.opened = true;
+        app.mode = Mode::Build;
         app.action(Action::Search);
         assert!(app.text_focus.is_none());
         assert!(app.browser == Browser::Catalog);
         app.room.running = true;
         app.action(Action::Preferences);
-        assert!(app.room.opened);
-        assert!(app.browser == Browser::Catalog);
+        assert_eq!(app.mode, Mode::Build);
+        assert!(app.preferences.is_none());
         assert!(app.message.contains("Stop"));
         app.action(Action::Room(room::Action::Stop));
         app.action(Action::Preferences);
-        assert!(!app.room.opened);
-        assert!(app.browser == Browser::General);
+        assert_eq!(app.mode, Mode::Listen);
+        assert_eq!(app.preferences, Some(PreferencePage::General));
     }
     #[test]
     fn global_shortcuts_preserve_room_modal_and_its_edit() {
         let (_directory, mut app) = emulated_app();
-        app.room.opened = true;
+        app.mode = Mode::Build;
         app.room.dialog = Some(room::Dialog::MeasurementName);
         app.text_focus = Some(TextFocus::Room {
             target: room::Text::MeasurementName,
@@ -5436,7 +5625,7 @@ mod regression_tests {
         assert!(app.browser == Browser::Catalog);
         for action in [Action::Preferences, Action::SavePreset, Action::Search] {
             app.action(action);
-            assert!(app.browser == Browser::Catalog);
+            assert!(app.preferences.is_none());
             assert_eq!(app.room.dialog, Some(room::Dialog::MeasurementName));
             assert!(
                 matches!(&app.text_focus, Some(TextFocus::Room { field, .. })
@@ -5730,7 +5919,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn graph_controls_follow_assets_and_bypass_lives_in_the_titlebar() {
+    fn graph_controls_follow_assets_and_bypass_sits_before_the_transport() {
         let (_directory, mut app) = app();
         assert!(!app.details, "Details starts collapsed");
         let endpoint = |id: &str| Endpoint {
@@ -5749,7 +5938,8 @@ mod regression_tests {
             .find(|(_, action)| *action == Action::Bypass)
             .unwrap()
             .0;
-        assert!(bypass.y0 >= 0.0 && bypass.y1 <= 32.0);
+        let header = app.header_bottom();
+        assert!(bypass.y0 >= 0.0 && bypass.y1 <= header);
         let transport: Vec<_> = app
             .hits
             .iter()
@@ -5760,7 +5950,7 @@ mod regression_tests {
         assert!(
             transport
                 .iter()
-                .any(|rect| rect.y0 >= 0.0 && rect.y1 <= 32.0 && rect.x1 + GAP <= bypass.x0)
+                .any(|rect| rect.y0 >= 0.0 && rect.y1 <= header && bypass.x1 + GAP <= rect.x0)
         );
         for action in [
             Action::ShowCandidate,
@@ -5971,7 +6161,8 @@ mod regression_tests {
             .find(|(_, hit)| *hit == Action::EditNumber(target))
             .unwrap()
             .0;
-        app.cursor = Point::new(INSET + 4.0, control.center().y);
+        let pane = app.preference_pane(Size::new(WIDTH, HEIGHT));
+        app.cursor = Point::new(pane.x0 + INSET + 4.0, control.center().y);
         let label_hint = app.help_target().expect("the setting label offers help");
         app.cursor = control.center();
         assert!(app.help_target() == Some(label_hint));
@@ -6147,6 +6338,9 @@ mod regression_tests {
             rate: Rate::Hz48000,
             estimated_latency_ms: 12.0,
         };
+        // The preset picker lives in the compact titlebar; the full header
+        // lists recent profiles instead.
+        app.settings.window_mode = WindowMode::Compact;
         app.action(Action::PresetPicker);
         app.text_key(&Key::Character("night".into()), Some("night"));
         assert_eq!(app.filtered_picker_options().len(), 1);
@@ -6158,6 +6352,7 @@ mod regression_tests {
         assert_eq!(app.active.hash, saved);
         assert_eq!(app.active.correction.rate, Rate::Hz48000);
         assert_eq!(app.settings.presets[&saved], "Night listening");
+        app.settings.window_mode = WindowMode::Full;
         let prepared = Arc::new(
             app.active
                 .correction
@@ -6167,21 +6362,22 @@ mod regression_tests {
         app.active_from_receipt(prepared);
         assert_eq!(app.active.hash, saved);
         app.action(Action::BrowsePresets);
+        app.action(Action::BrowseGeneral);
         app.build_scene(Size::new(WIDTH, HEIGHT), 1.0);
         for action in [
             Action::BrowseGeneral,
             Action::BrowseGeneration,
-            Action::BrowsePresets,
+            Action::BrowseSpectrum,
         ] {
             let bounds = app.hits.iter().find(|(_, hit)| *hit == action).unwrap().0;
-            assert_eq!(bounds.y0, app.window_chrome.unwrap().height);
+            assert_eq!(bounds.y0, app.header_bottom());
             assert_eq!(bounds.height(), 48.0);
         }
         assert!(
             app.hits
                 .iter()
                 .filter(|(_, action)| *action == Action::Preferences)
-                .all(|(bounds, _)| bounds.y1 <= app.window_chrome.unwrap().height)
+                .all(|(bounds, _)| bounds.y1 <= app.header_bottom())
         );
         let remove = app
             .hits
@@ -6506,21 +6702,20 @@ mod regression_tests {
         assert_eq!(restored.appearance.dark.name(), "Dracula");
         assert_eq!(restored.appearance.light.name(), "Breadog");
         app.build_scene(Size::new(WIDTH, HEIGHT), 1.0);
-        let capture = app
-            .hits
-            .iter()
-            .find(|(_, a)| *a == Action::Capture)
-            .unwrap()
-            .0;
-        let playback = app
-            .hits
-            .iter()
-            .find(|(_, a)| *a == Action::Playback)
-            .unwrap()
-            .0;
-        assert_eq!(capture.y0, playback.y0);
-        assert!(capture.x1 < playback.x0);
-        assert!(!app.hits.iter().any(|(_, a)| matches!(a, Action::Select(_))));
+        let pane = app.preference_pane(Size::new(WIDTH, HEIGHT));
+        assert!(
+            app.hits
+                .iter()
+                .filter(|(bounds, _)| bounds.y0 >= pane.y0 && bounds.x1 > pane.x0)
+                .all(|(bounds, _)| bounds.x0 >= pane.x0),
+            "the panel covers what lies under it"
+        );
+        assert!(
+            app.hits
+                .iter()
+                .any(|(bounds, a)| *a == Action::Search && bounds.x1 <= SIDEBAR),
+            "the catalog search stays usable beside preferences"
+        );
     }
     #[test]
     fn restored_presets_regenerate_from_the_managed_recipe_without_catalog_assets() {

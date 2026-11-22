@@ -33,6 +33,9 @@ impl Action {
             Self::ValueBar(ValueBar::Volume) => {
                 "Listening level after processing. Alt-click restores -18 dB."
             }
+            Self::ValueBar(ValueBar::HeadroomFollow) => {
+                "Share of the anti-clipping attenuation applied to corrected and bypass audio. Lower it for quiet sources; loud ones may clip. Alt-click restores 100%."
+            }
             Self::Compensation => {
                 "Matches corrected and bypass levels using a pink-noise reference."
             }
@@ -142,7 +145,9 @@ pub struct Hint {
     text: &'static str,
 }
 
-pub fn target(hits: &[(Rect, Action)], cursor: Point, preferences: bool) -> Option<Hint> {
+/// `preferences` is the open preferences panel, whose setting labels share
+/// their control's explanation.
+pub fn target(hits: &[(Rect, Action)], cursor: Point, preferences: Option<Rect>) -> Option<Hint> {
     if let Some((bounds, action)) = hits
         .iter()
         .rev()
@@ -150,41 +155,43 @@ pub fn target(hits: &[(Rect, Action)], cursor: Point, preferences: bool) -> Opti
     {
         return hint_for(hits, *bounds, *action, preferences);
     }
-    // Setting labels share their control's explanation without becoming click targets.
-    if preferences && (super::INSET..super::SIDEBAR - super::INSET).contains(&cursor.x) {
-        hits.iter()
-            .rev()
-            .filter_map(|(bounds, action)| {
-                if bounds.x0 >= super::SIDEBAR || bounds.area() == 0.0 {
-                    return None;
-                }
-                hint_for(hits, *bounds, *action, true)
-            })
-            .find(|hint| hint.bounds.contains(cursor))
-    } else {
-        None
+    let pane = preferences?;
+    if !(pane.x0 + super::INSET..pane.x1 - super::INSET).contains(&cursor.x) {
+        return None;
     }
+    // Setting labels share their control's explanation without becoming click targets.
+    hits.iter()
+        .rev()
+        .filter_map(|(bounds, action)| {
+            if bounds.x0 < pane.x0 || bounds.area() == 0.0 {
+                return None;
+            }
+            hint_for(hits, *bounds, *action, preferences)
+        })
+        .find(|hint| hint.bounds.contains(cursor))
 }
 fn hint_for(
     hits: &[(Rect, Action)],
     bounds: Rect,
     action: Action,
-    preferences: bool,
+    preferences: Option<Rect>,
 ) -> Option<Hint> {
     let text = action.help()?;
+    let in_pane = |rect: &Rect| preferences.is_some_and(|pane| rect.x0 >= pane.x0);
     let mut group = hits
         .iter()
         .filter(|(other, action)| {
             other.area() > 0.0
                 && (other.x0 < super::SIDEBAR) == (bounds.x0 < super::SIDEBAR)
+                && in_pane(other) == in_pane(&bounds)
                 && other.y0 < bounds.y1
                 && other.y1 > bounds.y0
                 && action.help() == Some(text)
         })
         .fold(bounds, |union, (other, _)| union.union(*other));
-    if preferences && group.x0 < super::SIDEBAR {
-        group.x0 = super::INSET;
-        group.x1 = super::SIDEBAR - super::INSET;
+    if let Some(pane) = preferences.filter(|_| in_pane(&group)) {
+        group.x0 = pane.x0 + super::INSET;
+        group.x1 = pane.x1 - super::INSET;
         if matches!(action, Action::ThemePicker(_)) {
             group.y0 -= 26.0;
         }

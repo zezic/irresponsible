@@ -111,6 +111,9 @@ impl Delay {
 pub struct Analysis {
     pub max_boost_db: f32,
     pub pink_rms_gain: f32,
+    /// Attenuation that keeps both paths from clipping a full-scale input.
+    pub safety_db: f32,
+    /// Share of `safety_db` actually applied to both paths.
     pub headroom_db: f32,
     pub wet_db: f32,
     pub dry_db: f32,
@@ -144,6 +147,7 @@ impl Analysis {
         let mut result = Self {
             max_boost_db: gain_db(maximum),
             pink_rms_gain: (power / weights).sqrt(),
+            safety_db: 0.0,
             headroom_db: 0.0,
             wet_db: 0.0,
             dry_db: 0.0,
@@ -159,7 +163,8 @@ impl Analysis {
         };
         self.wet_db = -difference.max(0.0) + controls.trim.db();
         self.dry_db = difference.min(0.0);
-        self.headroom_db = -(self.max_boost_db + self.wet_db).max(self.dry_db).max(0.0) - 1.0;
+        self.safety_db = -(self.max_boost_db + self.wet_db).max(self.dry_db).max(0.0) - 1.0;
+        self.headroom_db = self.safety_db * controls.headroom.fraction();
     }
 }
 
@@ -317,4 +322,31 @@ impl Processor {
 
 fn approach(current: f32, target: f32, step: f32) -> f32 {
     current + (target - current).clamp(-step, step)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{HeadroomFollow, Rate};
+
+    #[test]
+    fn headroom_follow_scales_safety_attenuation_on_both_paths() {
+        let mut boosted = Correction::identity(Rate::Hz48000);
+        boosted.channels = [vec![4.0], vec![4.0]];
+        let controls = |percent| Controls {
+            comparison: Comparison::Uncompensated,
+            headroom: HeadroomFollow::try_from(percent).unwrap(),
+            ..Controls::default()
+        };
+        let full = Analysis::new(&boosted, controls(100.0));
+        assert!(full.safety_db < -12.0);
+        assert_eq!(full.headroom_db, full.safety_db);
+        let half = Analysis::new(&boosted, controls(50.0));
+        assert_eq!(half.safety_db, full.safety_db);
+        assert_eq!(half.headroom_db, full.safety_db * 0.5);
+        let mut engine = Engine::new(Arc::new(boosted), controls(0.0));
+        assert_eq!(engine.analysis.headroom_db, 0.0);
+        engine.configure(controls(0.0));
+        assert_eq!(engine.dry_target, 1.0);
+    }
 }
